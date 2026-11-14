@@ -6,6 +6,7 @@ import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sd
 import type { gmail_v1 } from "googleapis";
 import { z } from "zod";
 import { normalizeEmail, unknownAccountError } from "./auth.js";
+import { recipientAllowedBy, type Features } from "./config.js";
 import { buildRaw, parseMessage } from "./mime.js";
 
 type Gmail = gmail_v1.Gmail;
@@ -14,6 +15,8 @@ export interface Accounts {
   clients: Map<string, Gmail>;
   /** The account this session's bearer token is bound to; used when `account` is omitted. */
   default: string;
+  /** Fork guardrails. Defaults to pull mode with every optional tool family off. */
+  features?: Features;
 }
 
 const json = (v: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(v ?? {}, null, 2) }] });
@@ -86,6 +89,15 @@ const classification = {
 };
 
 export const registerTools = (server: McpServer, accounts: Accounts): void => {
+  // Enforcement defaults: pull mode, nothing optional. A caller that forgets `features`
+  // gets the most restrictive tool set, never the opposite.
+  const features: Features = accounts.features ?? {
+    mode: "pull",
+    allowlist: [],
+    settingsTools: false,
+    workspaceTools: false,
+    dangerousTools: false,
+  };
   const known = () => [...accounts.clients.keys()].sort();
   const resolve = (account?: string): { email: string; gmail: Gmail } => {
     const email = normalizeEmail(account?.trim() || accounts.default);
@@ -139,24 +151,51 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
       const { data } = await gmail.users.messages.get(a);
       return { data: a.format === "full" ? parseMessage(data) : data };
     }));
-  tool("gmail_send_message", "Compose and send an email with optional attachments", { ...ids, ...composeShape },
-    ({ userId, ...c }, gmail, call) => call(async () => gmail.users.messages.send({ userId, requestBody: await rawMessage(c) })));
-  tool("gmail_send_raw", "Send a pre-built RFC 822 message (base64url `raw`)",
-    { ...ids, raw: z.string(), threadId: z.string().optional() },
-    ({ userId, ...requestBody }, gmail, call) => call(() => gmail.users.messages.send({ userId, requestBody })));
-  tool("gmail_insert_message", "Insert a message directly into the mailbox, bypassing scanning and classification",
-    { ...composeShape, ...ids, labelIds: z.array(z.string()).optional(),
-      internalDateSource: z.enum(["receivedTime", "dateHeader"]).optional(), deleted: z.boolean().optional() },
-    ({ userId, labelIds, internalDateSource, deleted, ...c }, gmail, call) =>
-      call(async () => gmail.users.messages.insert({ userId, internalDateSource, deleted,
-        requestBody: await rawMessage(c, labelIds) })));
-  tool("gmail_import_message", "Import a message with standard delivery scanning (like SMTP receipt)",
-    { ...composeShape, ...ids, labelIds: z.array(z.string()).optional(),
-      internalDateSource: z.enum(["receivedTime", "dateHeader"]).optional(),
-      neverMarkSpam: z.boolean().optional(), processForCalendar: z.boolean().optional(), deleted: z.boolean().optional() },
-    ({ userId, labelIds, internalDateSource, neverMarkSpam, processForCalendar, deleted, ...c }, gmail, call) =>
-      call(async () => gmail.users.messages.import({ userId, internalDateSource, neverMarkSpam, processForCalendar, deleted,
-        requestBody: await rawMessage(c, labelIds) })));
+  if (features.mode === "pull_push") {
+    // Allowlist guard at the tool boundary: an injected email cannot talk the model into
+    // sending anywhere the operator did not allow. parseConfig guarantees a non-empty
+    // allowlist for pull_push, but refuse closed if one is missing anyway.
+    const allowed = recipientAllowedBy(features.allowlist);
+    const guardRecipients = (c: { to?: string[]; cc?: string[]; bcc?: string[] }): void => {
+      const refused = [...(c.to ?? []), ...(c.cc ?? []), ...(c.bcc ?? [])].filter((r) => !allowed(r));
+      if (refused.length > 0) {
+        throw new Error(
+          `Send refused by SEND_ALLOWLIST. Not allowed: ${refused.join(", ")}. ` +
+            `Allowed: ${features.allowlist.join(", ")}.`
+        );
+      }
+    };
+    /** Pulls To/Cc/Bcc out of a stored message's headers so drafts are guarded too. */
+    const guardStoredRecipients = async (gmail: Gmail, userId: string, messageId: string): Promise<void> => {
+      const { data } = await gmail.users.messages.get({ userId, id: messageId, format: "metadata",
+        metadataHeaders: ["To", "Cc", "Bcc"] });
+      const headers = data.payload?.headers ?? [];
+      const value = (name: string) => headers.find((h) => h.name?.toLowerCase() === name)?.value ?? "";
+      const recipients = ["to", "cc", "bcc"]
+        .flatMap((name) => (value(name) || "").split(","))
+        .map((r) => r.trim())
+        .filter(Boolean);
+      const refused = recipients.filter((r) => !allowed(r));
+      if (refused.length > 0) {
+        throw new Error(
+          `Send refused by SEND_ALLOWLIST (draft recipients). Not allowed: ${refused.join(", ")}. ` +
+            `Allowed: ${features.allowlist.join(", ")}.`
+        );
+      }
+    };
+    tool("gmail_send_message", "Compose and send an email with optional attachments. Recipients must match SEND_ALLOWLIST",
+      { ...ids, ...composeShape },
+      ({ userId, ...c }, gmail, call) => call(async () => {
+        guardRecipients(c);
+        return gmail.users.messages.send({ userId, requestBody: await rawMessage(c) });
+      }));
+    tool("gmail_send_draft", "Send an existing draft (its stored recipients are checked against SEND_ALLOWLIST first)",
+      { ...ids, id: z.string() },
+      ({ userId, id }, gmail, call) => call(async () => {
+        await guardStoredRecipients(gmail, userId, id);
+        return gmail.users.drafts.send({ userId, requestBody: { id } });
+      }));
+  }
   tool("gmail_modify_message", "Add/remove labels on a message (read/unread, star, archive, custom and classification labels)",
     { ...ids, id: z.string(), addLabelIds: z.array(z.string()).optional(), removeLabelIds: z.array(z.string()).optional(), ...classification },
     ({ userId, id, ...requestBody }, gmail, call) => call(() => gmail.users.messages.modify({ userId, id, requestBody })));
@@ -166,11 +205,31 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     ({ userId, ...requestBody }, gmail, call) => call(() => gmail.users.messages.batchModify({ userId, requestBody })));
   tool("gmail_trash_message", "Move a message to Trash", { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.messages.trash(a)));
   tool("gmail_untrash_message", "Restore a message from Trash", { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.messages.untrash(a)));
-  tool("gmail_delete_message", "Permanently delete a message (bypasses Trash; needs full mail scope)",
-    { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.messages.delete(a)));
-  tool("gmail_batch_delete_messages", "Permanently delete many messages (bypasses Trash; needs full mail scope)",
-    { ...ids, ids: z.array(z.string()).min(1).max(1000) },
-    ({ userId, ids }, gmail, call) => call(() => gmail.users.messages.batchDelete({ userId, requestBody: { ids } })));
+  if (features.dangerousTools) {
+    // Irreversible or guard-bypassing operations. Each also needs scopes this fork never
+    // requests implicitly (see config.ts / auth.ts), so enabling the flag alone is not enough.
+    tool("gmail_send_raw", "Send a pre-built RFC 822 message (base64url `raw`). Bypasses SEND_ALLOWLIST; enable deliberately",
+      { ...ids, raw: z.string(), threadId: z.string().optional() },
+      ({ userId, ...requestBody }, gmail, call) => call(() => gmail.users.messages.send({ userId, requestBody })));
+    tool("gmail_insert_message", "Insert a message directly into the mailbox, bypassing scanning and classification",
+      { ...composeShape, ...ids, labelIds: z.array(z.string()).optional(),
+        internalDateSource: z.enum(["receivedTime", "dateHeader"]).optional(), deleted: z.boolean().optional() },
+      ({ userId, labelIds, internalDateSource, deleted, ...c }, gmail, call) =>
+        call(async () => gmail.users.messages.insert({ userId, internalDateSource, deleted,
+          requestBody: await rawMessage(c, labelIds) })));
+    tool("gmail_import_message", "Import a message with standard delivery scanning (like SMTP receipt)",
+      { ...composeShape, ...ids, labelIds: z.array(z.string()).optional(),
+        internalDateSource: z.enum(["receivedTime", "dateHeader"]).optional(),
+        neverMarkSpam: z.boolean().optional(), processForCalendar: z.boolean().optional(), deleted: z.boolean().optional() },
+      ({ userId, labelIds, internalDateSource, neverMarkSpam, processForCalendar, deleted, ...c }, gmail, call) =>
+        call(async () => gmail.users.messages.import({ userId, internalDateSource, neverMarkSpam, processForCalendar, deleted,
+          requestBody: await rawMessage(c, labelIds) })));
+    tool("gmail_delete_message", "Permanently delete a message (bypasses Trash; needs full mail scope)",
+      { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.messages.delete(a)));
+    tool("gmail_batch_delete_messages", "Permanently delete many messages (bypasses Trash; needs full mail scope)",
+      { ...ids, ids: z.array(z.string()).min(1).max(1000) },
+      ({ userId, ids }, gmail, call) => call(() => gmail.users.messages.batchDelete({ userId, requestBody: { ids } })));
+  }
   tool("gmail_get_attachment", "Download an attachment. Returns base64 data, or writes to savePath and returns the path",
     { ...ids, messageId: z.string(), id: z.string().describe("attachmentId from gmail_get_message"),
       savePath: z.string().optional().describe("Write bytes here instead of returning them") },
@@ -202,9 +261,12 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     ({ userId, id, ...requestBody }, gmail, call) => call(() => gmail.users.threads.modify({ userId, id, requestBody })));
   tool("gmail_trash_thread", "Move a thread to Trash", { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.threads.trash(a)));
   tool("gmail_untrash_thread", "Restore a thread from Trash", { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.threads.untrash(a)));
-  tool("gmail_delete_thread", "Permanently delete a thread (needs full mail scope)", { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.threads.delete(a)));
+  if (features.dangerousTools) {
+    tool("gmail_delete_thread", "Permanently delete a thread (needs full mail scope)", { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.threads.delete(a)));
+  }
 
   // ---- drafts ----
+  // Listing and discarding drafts is organizing; composing one appears in draft mode and up.
   tool("gmail_list_drafts", "List drafts",
     { ...ids, q: z.string().optional(), maxResults: z.number().int().min(1).max(500).optional().describe("Defaults to the Gmail API default of 100"), pageToken: z.string().optional(), includeSpamTrash: z.boolean().optional() },
     (a, gmail, call) => call(() => gmail.users.drafts.list(a)));
@@ -213,13 +275,15 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
       const { data } = await gmail.users.drafts.get(a);
       return { data: a.format === "full" && data.message ? { id: data.id, message: parseMessage(data.message) } : data };
     }));
-  tool("gmail_create_draft", "Create a draft with optional attachments", { ...ids, ...composeShape },
-    ({ userId, ...c }, gmail, call) => call(async () => gmail.users.drafts.create({ userId, requestBody: { message: await rawMessage(c) } })));
-  tool("gmail_update_draft", "Replace a draft's content", { ...ids, id: z.string(), ...composeShape },
-    ({ userId, id, ...c }, gmail, call) => call(async () => gmail.users.drafts.update({ userId, id, requestBody: { message: await rawMessage(c) } })));
-  tool("gmail_send_draft", "Send an existing draft", { ...ids, id: z.string() },
-    ({ userId, id }, gmail, call) => call(() => gmail.users.drafts.send({ userId, requestBody: { id } })));
   tool("gmail_delete_draft", "Discard a draft", { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.drafts.delete(a)));
+  if (features.mode !== "pull") {
+    tool("gmail_create_draft", "Create a draft with optional attachments (review and send it from Gmail)",
+      { ...ids, ...composeShape },
+      ({ userId, ...c }, gmail, call) => call(async () => gmail.users.drafts.create({ userId, requestBody: { message: await rawMessage(c) } })));
+    tool("gmail_update_draft", "Replace a draft's content",
+      { ...ids, id: z.string(), ...composeShape },
+      ({ userId, id, ...c }, gmail, call) => call(async () => gmail.users.drafts.update({ userId, id, requestBody: { message: await rawMessage(c) } })));
+  }
 
   // ---- labels ----
   const labelShape = {
@@ -244,82 +308,91 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     (a, gmail, call) => call(() => gmail.users.history.list(a)));
 
   // ---- settings ----
-  tool("gmail_get_auto_forwarding", "Auto-forwarding setting", ids, (a, gmail, call) => call(() => gmail.users.settings.getAutoForwarding(a)));
-  tool("gmail_update_auto_forwarding", "Set auto-forwarding (address must be a verified forwarding address)",
-    { ...ids, enabled: z.boolean(), emailAddress: z.string().optional(), disposition: z.enum(["leaveInInbox", "archive", "trash", "markRead"]).optional() },
-    ({ userId, ...requestBody }, gmail, call) => call(() => gmail.users.settings.updateAutoForwarding({ userId, requestBody })));
-  tool("gmail_get_imap", "IMAP settings", ids, (a, gmail, call) => call(() => gmail.users.settings.getImap(a)));
-  tool("gmail_update_imap", "Update IMAP settings", { ...ids, settings: body.describe("ImapSettings: enabled, autoExpunge, expungeBehavior, maxFolderSize") },
-    ({ userId, settings }, gmail, call) => call(() => gmail.users.settings.updateImap({ userId, requestBody: settings })));
-  tool("gmail_get_pop", "POP settings", ids, (a, gmail, call) => call(() => gmail.users.settings.getPop(a)));
-  tool("gmail_update_pop", "Update POP settings", { ...ids, settings: body.describe("PopSettings: accessWindow, disposition") },
-    ({ userId, settings }, gmail, call) => call(() => gmail.users.settings.updatePop({ userId, requestBody: settings })));
-  tool("gmail_get_vacation", "Vacation responder settings", ids, (a, gmail, call) => call(() => gmail.users.settings.getVacation(a)));
-  tool("gmail_update_vacation", "Update vacation responder",
-    { ...ids, enableAutoReply: z.boolean(), responseSubject: z.string().optional(), responseBodyPlainText: z.string().optional(),
-      responseBodyHtml: z.string().optional(), restrictToContacts: z.boolean().optional(), restrictToDomain: z.boolean().optional(),
-      startTime: z.string().optional().describe("epoch ms"), endTime: z.string().optional().describe("epoch ms") },
-    ({ userId, ...requestBody }, gmail, call) => call(() => gmail.users.settings.updateVacation({ userId, requestBody })));
-  tool("gmail_get_language", "Display language", ids, (a, gmail, call) => call(() => gmail.users.settings.getLanguage(a)));
-  tool("gmail_update_language", "Set display language", { ...ids, displayLanguage: z.string() },
-    ({ userId, ...requestBody }, gmail, call) => call(() => gmail.users.settings.updateLanguage({ userId, requestBody })));
+  // Mailbox configuration beyond organizing. Off by default: an injected email should
+  // not be able to reroute a mailbox (auto-forwarding) or rewrite filter rules.
+  if (features.settingsTools) {
+    tool("gmail_get_auto_forwarding", "Auto-forwarding setting", ids, (a, gmail, call) => call(() => gmail.users.settings.getAutoForwarding(a)));
+    tool("gmail_update_auto_forwarding", "Set auto-forwarding (address must be a verified forwarding address)",
+      { ...ids, enabled: z.boolean(), emailAddress: z.string().optional(), disposition: z.enum(["leaveInInbox", "archive", "trash", "markRead"]).optional() },
+      ({ userId, ...requestBody }, gmail, call) => call(() => gmail.users.settings.updateAutoForwarding({ userId, requestBody })));
+    tool("gmail_get_imap", "IMAP settings", ids, (a, gmail, call) => call(() => gmail.users.settings.getImap(a)));
+    tool("gmail_update_imap", "Update IMAP settings", { ...ids, settings: body.describe("ImapSettings: enabled, autoExpunge, expungeBehavior, maxFolderSize") },
+      ({ userId, settings }, gmail, call) => call(() => gmail.users.settings.updateImap({ userId, requestBody: settings })));
+    tool("gmail_get_pop", "POP settings", ids, (a, gmail, call) => call(() => gmail.users.settings.getPop(a)));
+    tool("gmail_update_pop", "Update POP settings", { ...ids, settings: body.describe("PopSettings: accessWindow, disposition") },
+      ({ userId, settings }, gmail, call) => call(() => gmail.users.settings.updatePop({ userId, requestBody: settings })));
+    tool("gmail_get_vacation", "Vacation responder settings", ids, (a, gmail, call) => call(() => gmail.users.settings.getVacation(a)));
+    tool("gmail_update_vacation", "Update vacation responder",
+      { ...ids, enableAutoReply: z.boolean(), responseSubject: z.string().optional(), responseBodyPlainText: z.string().optional(),
+        responseBodyHtml: z.string().optional(), restrictToContacts: z.boolean().optional(), restrictToDomain: z.boolean().optional(),
+        startTime: z.string().optional().describe("epoch ms"), endTime: z.string().optional().describe("epoch ms") },
+      ({ userId, ...requestBody }, gmail, call) => call(() => gmail.users.settings.updateVacation({ userId, requestBody })));
+    tool("gmail_get_language", "Display language", ids, (a, gmail, call) => call(() => gmail.users.settings.getLanguage(a)));
+    tool("gmail_update_language", "Set display language", { ...ids, displayLanguage: z.string() },
+      ({ userId, ...requestBody }, gmail, call) => call(() => gmail.users.settings.updateLanguage({ userId, requestBody })));
 
-  tool("gmail_list_delegates", "List delegates", ids, (a, gmail, call) => call(() => gmail.users.settings.delegates.list(a)));
-  tool("gmail_get_delegate", "Get a delegate", { ...ids, delegateEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.delegates.get(a)));
-  tool("gmail_create_delegate", "Add a delegate (Workspace only)", { ...ids, delegateEmail: z.string() },
-    ({ userId, delegateEmail }, gmail, call) => call(() => gmail.users.settings.delegates.create({ userId, requestBody: { delegateEmail } })));
-  tool("gmail_delete_delegate", "Remove a delegate", { ...ids, delegateEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.delegates.delete(a)));
+    tool("gmail_list_filters", "List filters", ids, (a, gmail, call) => call(() => gmail.users.settings.filters.list(a)));
+    tool("gmail_get_filter", "Get a filter", { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.filters.get(a)));
+    tool("gmail_create_filter", "Create a filter",
+      { ...ids,
+        criteria: z.object({ from: z.string().optional(), to: z.string().optional(), subject: z.string().optional(), query: z.string().optional(),
+          negatedQuery: z.string().optional(), hasAttachment: z.boolean().optional(), excludeChats: z.boolean().optional(),
+          size: z.number().optional(), sizeComparison: z.enum(["larger", "smaller"]).optional() }),
+        action: z.object({ addLabelIds: z.array(z.string()).optional(), removeLabelIds: z.array(z.string()).optional(), forward: z.string().optional() }) },
+      ({ userId, ...requestBody }, gmail, call) => call(() => gmail.users.settings.filters.create({ userId, requestBody })));
+    tool("gmail_delete_filter", "Delete a filter", { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.filters.delete(a)));
 
-  tool("gmail_list_filters", "List filters", ids, (a, gmail, call) => call(() => gmail.users.settings.filters.list(a)));
-  tool("gmail_get_filter", "Get a filter", { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.filters.get(a)));
-  tool("gmail_create_filter", "Create a filter",
-    { ...ids,
-      criteria: z.object({ from: z.string().optional(), to: z.string().optional(), subject: z.string().optional(), query: z.string().optional(),
-        negatedQuery: z.string().optional(), hasAttachment: z.boolean().optional(), excludeChats: z.boolean().optional(),
-        size: z.number().optional(), sizeComparison: z.enum(["larger", "smaller"]).optional() }),
-      action: z.object({ addLabelIds: z.array(z.string()).optional(), removeLabelIds: z.array(z.string()).optional(), forward: z.string().optional() }) },
-    ({ userId, ...requestBody }, gmail, call) => call(() => gmail.users.settings.filters.create({ userId, requestBody })));
-  tool("gmail_delete_filter", "Delete a filter", { ...ids, id: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.filters.delete(a)));
+    tool("gmail_list_forwarding_addresses", "List forwarding addresses", ids, (a, gmail, call) => call(() => gmail.users.settings.forwardingAddresses.list(a)));
+    tool("gmail_get_forwarding_address", "Get a forwarding address", { ...ids, forwardingEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.forwardingAddresses.get(a)));
+    tool("gmail_create_forwarding_address", "Add a forwarding address (triggers verification mail)", { ...ids, forwardingEmail: z.string() },
+      ({ userId, forwardingEmail }, gmail, call) => call(() => gmail.users.settings.forwardingAddresses.create({ userId, requestBody: { forwardingEmail } })));
+    tool("gmail_delete_forwarding_address", "Remove a forwarding address", { ...ids, forwardingEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.forwardingAddresses.delete(a)));
 
-  tool("gmail_list_forwarding_addresses", "List forwarding addresses", ids, (a, gmail, call) => call(() => gmail.users.settings.forwardingAddresses.list(a)));
-  tool("gmail_get_forwarding_address", "Get a forwarding address", { ...ids, forwardingEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.forwardingAddresses.get(a)));
-  tool("gmail_create_forwarding_address", "Add a forwarding address (triggers verification mail)", { ...ids, forwardingEmail: z.string() },
-    ({ userId, forwardingEmail }, gmail, call) => call(() => gmail.users.settings.forwardingAddresses.create({ userId, requestBody: { forwardingEmail } })));
-  tool("gmail_delete_forwarding_address", "Remove a forwarding address", { ...ids, forwardingEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.forwardingAddresses.delete(a)));
+    tool("gmail_list_send_as", "List send-as aliases", ids, (a, gmail, call) => call(() => gmail.users.settings.sendAs.list(a)));
+    tool("gmail_get_send_as", "Get a send-as alias", { ...ids, sendAsEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.get(a)));
+    tool("gmail_create_send_as", "Create a send-as alias", { ...ids, sendAs: body.describe("SendAs resource: sendAsEmail, displayName, replyToAddress, signature, smtpMsa, treatAsAlias, isDefault") },
+      ({ userId, sendAs }, gmail, call) => call(() => gmail.users.settings.sendAs.create({ userId, requestBody: sendAs })));
+    tool("gmail_update_send_as", "Replace a send-as alias (e.g. set signature)", { ...ids, sendAsEmail: z.string(), sendAs: body },
+      ({ userId, sendAsEmail, sendAs }, gmail, call) => call(() => gmail.users.settings.sendAs.update({ userId, sendAsEmail, requestBody: sendAs })));
+    tool("gmail_patch_send_as", "Partially update a send-as alias", { ...ids, sendAsEmail: z.string(), sendAs: body },
+      ({ userId, sendAsEmail, sendAs }, gmail, call) => call(() => gmail.users.settings.sendAs.patch({ userId, sendAsEmail, requestBody: sendAs })));
+    tool("gmail_delete_send_as", "Delete a send-as alias", { ...ids, sendAsEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.delete(a)));
+    tool("gmail_verify_send_as", "Re-send verification for a send-as alias", { ...ids, sendAsEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.verify(a)));
+  }
 
-  tool("gmail_list_send_as", "List send-as aliases", ids, (a, gmail, call) => call(() => gmail.users.settings.sendAs.list(a)));
-  tool("gmail_get_send_as", "Get a send-as alias", { ...ids, sendAsEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.get(a)));
-  tool("gmail_create_send_as", "Create a send-as alias", { ...ids, sendAs: body.describe("SendAs resource: sendAsEmail, displayName, replyToAddress, signature, smtpMsa, treatAsAlias, isDefault") },
-    ({ userId, sendAs }, gmail, call) => call(() => gmail.users.settings.sendAs.create({ userId, requestBody: sendAs })));
-  tool("gmail_update_send_as", "Replace a send-as alias (e.g. set signature)", { ...ids, sendAsEmail: z.string(), sendAs: body },
-    ({ userId, sendAsEmail, sendAs }, gmail, call) => call(() => gmail.users.settings.sendAs.update({ userId, sendAsEmail, requestBody: sendAs })));
-  tool("gmail_patch_send_as", "Partially update a send-as alias", { ...ids, sendAsEmail: z.string(), sendAs: body },
-    ({ userId, sendAsEmail, sendAs }, gmail, call) => call(() => gmail.users.settings.sendAs.patch({ userId, sendAsEmail, requestBody: sendAs })));
-  tool("gmail_delete_send_as", "Delete a send-as alias", { ...ids, sendAsEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.delete(a)));
-  tool("gmail_verify_send_as", "Re-send verification for a send-as alias", { ...ids, sendAsEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.verify(a)));
+  // ---- Workspace only ----
+  // Delegates, S/MIME and client-side encryption do not exist on consumer @gmail.com
+  // accounts; every call 403s. Off unless explicitly enabled.
+  if (features.workspaceTools) {
+    tool("gmail_list_delegates", "List delegates (Workspace only)", ids, (a, gmail, call) => call(() => gmail.users.settings.delegates.list(a)));
+    tool("gmail_get_delegate", "Get a delegate (Workspace only)", { ...ids, delegateEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.delegates.get(a)));
+    tool("gmail_create_delegate", "Add a delegate (Workspace only)", { ...ids, delegateEmail: z.string() },
+      ({ userId, delegateEmail }, gmail, call) => call(() => gmail.users.settings.delegates.create({ userId, requestBody: { delegateEmail } })));
+    tool("gmail_delete_delegate", "Remove a delegate (Workspace only)", { ...ids, delegateEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.delegates.delete(a)));
 
-  tool("gmail_list_smime_info", "List S/MIME configs for an alias", { ...ids, sendAsEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.smimeInfo.list(a)));
-  tool("gmail_get_smime_info", "Get an S/MIME config", { ...ids, sendAsEmail: z.string(), id: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.smimeInfo.get(a)));
-  tool("gmail_insert_smime_info", "Upload an S/MIME config", { ...ids, sendAsEmail: z.string(), smimeInfo: body.describe("SmimeInfo: pkcs12 (base64), encryptedKeyPassword, isDefault") },
-    ({ userId, sendAsEmail, smimeInfo }, gmail, call) => call(() => gmail.users.settings.sendAs.smimeInfo.insert({ userId, sendAsEmail, requestBody: smimeInfo })));
-  tool("gmail_set_default_smime_info", "Set the default S/MIME config", { ...ids, sendAsEmail: z.string(), id: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.smimeInfo.setDefault(a)));
-  tool("gmail_delete_smime_info", "Delete an S/MIME config", { ...ids, sendAsEmail: z.string(), id: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.smimeInfo.delete(a)));
+    tool("gmail_list_smime_info", "List S/MIME configs for an alias (Workspace only)", { ...ids, sendAsEmail: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.smimeInfo.list(a)));
+    tool("gmail_get_smime_info", "Get an S/MIME config (Workspace only)", { ...ids, sendAsEmail: z.string(), id: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.smimeInfo.get(a)));
+    tool("gmail_insert_smime_info", "Upload an S/MIME config (Workspace only)", { ...ids, sendAsEmail: z.string(), smimeInfo: body.describe("SmimeInfo: pkcs12 (base64), encryptedKeyPassword, isDefault") },
+      ({ userId, sendAsEmail, smimeInfo }, gmail, call) => call(() => gmail.users.settings.sendAs.smimeInfo.insert({ userId, sendAsEmail, requestBody: smimeInfo })));
+    tool("gmail_set_default_smime_info", "Set the default S/MIME config (Workspace only)", { ...ids, sendAsEmail: z.string(), id: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.smimeInfo.setDefault(a)));
+    tool("gmail_delete_smime_info", "Delete an S/MIME config (Workspace only)", { ...ids, sendAsEmail: z.string(), id: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.sendAs.smimeInfo.delete(a)));
 
-  tool("gmail_list_cse_identities", "List client-side encryption identities", { ...ids, pageSize: z.number().optional(), pageToken: z.string().optional() },
-    (a, gmail, call) => call(() => gmail.users.settings.cse.identities.list(a)));
-  tool("gmail_get_cse_identity", "Get a CSE identity", { ...ids, cseEmailAddress: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.identities.get(a)));
-  tool("gmail_create_cse_identity", "Create a CSE identity", { ...ids, identity: body.describe("CseIdentity: emailAddress, primaryKeyPairId or signAndEncryptKeyPairs") },
-    ({ userId, identity }, gmail, call) => call(() => gmail.users.settings.cse.identities.create({ userId, requestBody: identity })));
-  tool("gmail_patch_cse_identity", "Update a CSE identity", { ...ids, emailAddress: z.string(), identity: body },
-    ({ userId, emailAddress, identity }, gmail, call) => call(() => gmail.users.settings.cse.identities.patch({ userId, emailAddress, requestBody: identity })));
-  tool("gmail_delete_cse_identity", "Delete a CSE identity", { ...ids, cseEmailAddress: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.identities.delete(a)));
+    tool("gmail_list_cse_identities", "List client-side encryption identities (Workspace only)", { ...ids, pageSize: z.number().optional(), pageToken: z.string().optional() },
+      (a, gmail, call) => call(() => gmail.users.settings.cse.identities.list(a)));
+    tool("gmail_get_cse_identity", "Get a CSE identity (Workspace only)", { ...ids, cseEmailAddress: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.identities.get(a)));
+    tool("gmail_create_cse_identity", "Create a CSE identity (Workspace only)", { ...ids, identity: body.describe("CseIdentity: emailAddress, primaryKeyPairId or signAndEncryptKeyPairs") },
+      ({ userId, identity }, gmail, call) => call(() => gmail.users.settings.cse.identities.create({ userId, requestBody: identity })));
+    tool("gmail_patch_cse_identity", "Update a CSE identity (Workspace only)", { ...ids, emailAddress: z.string(), identity: body },
+      ({ userId, emailAddress, identity }, gmail, call) => call(() => gmail.users.settings.cse.identities.patch({ userId, emailAddress, requestBody: identity })));
+    tool("gmail_delete_cse_identity", "Delete a CSE identity (Workspace only)", { ...ids, cseEmailAddress: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.identities.delete(a)));
 
-  tool("gmail_list_cse_keypairs", "List CSE key pairs", { ...ids, pageSize: z.number().optional(), pageToken: z.string().optional() },
-    (a, gmail, call) => call(() => gmail.users.settings.cse.keypairs.list(a)));
-  tool("gmail_get_cse_keypair", "Get a CSE key pair", { ...ids, keyPairId: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.keypairs.get(a)));
-  tool("gmail_create_cse_keypair", "Upload a CSE key pair", { ...ids, keyPair: body.describe("CseKeyPair: pkcs7, privateKeyMetadata") },
-    ({ userId, keyPair }, gmail, call) => call(() => gmail.users.settings.cse.keypairs.create({ userId, requestBody: keyPair })));
-  tool("gmail_enable_cse_keypair", "Enable a CSE key pair", { ...ids, keyPairId: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.keypairs.enable({ ...a, requestBody: {} })));
-  tool("gmail_disable_cse_keypair", "Disable a CSE key pair", { ...ids, keyPairId: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.keypairs.disable({ ...a, requestBody: {} })));
-  tool("gmail_obliterate_cse_keypair", "Permanently delete a disabled CSE key pair", { ...ids, keyPairId: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.keypairs.obliterate({ ...a, requestBody: {} })));
+    tool("gmail_list_cse_keypairs", "List CSE key pairs (Workspace only)", { ...ids, pageSize: z.number().optional(), pageToken: z.string().optional() },
+      (a, gmail, call) => call(() => gmail.users.settings.cse.keypairs.list(a)));
+    tool("gmail_get_cse_keypair", "Get a CSE key pair (Workspace only)", { ...ids, keyPairId: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.keypairs.get(a)));
+    tool("gmail_create_cse_keypair", "Upload a CSE key pair (Workspace only)", { ...ids, keyPair: body.describe("CseKeyPair: pkcs7, privateKeyMetadata") },
+      ({ userId, keyPair }, gmail, call) => call(() => gmail.users.settings.cse.keypairs.create({ userId, requestBody: keyPair })));
+    tool("gmail_enable_cse_keypair", "Enable a CSE key pair (Workspace only)", { ...ids, keyPairId: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.keypairs.enable({ ...a, requestBody: {} })));
+    tool("gmail_disable_cse_keypair", "Disable a CSE key pair (Workspace only)", { ...ids, keyPairId: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.keypairs.disable({ ...a, requestBody: {} })));
+    tool("gmail_obliterate_cse_keypair", "Permanently delete a disabled CSE key pair (Workspace only)", { ...ids, keyPairId: z.string() }, (a, gmail, call) => call(() => gmail.users.settings.cse.keypairs.obliterate({ ...a, requestBody: {} })));
+  }
 };

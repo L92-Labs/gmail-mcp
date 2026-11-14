@@ -10,6 +10,17 @@ import { assertValidAccount, CLIENT_KEY, fileStore, resolveStore, type SecretSto
 const configDir = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
 const dataDir = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
 
+/**
+ * Gmail REST root. Override (GMAIL_MCP_API_ROOT) points at a test double so the e2e
+ * suite exercises the real server and MCP protocol without touching a real mailbox.
+ */
+const rawApiRoot = process.env.GMAIL_MCP_API_ROOT?.trim();
+export const API_ROOT =
+  rawApiRoot && /^https?:\/\//.test(rawApiRoot) ? (rawApiRoot.endsWith("/") ? rawApiRoot : `${rawApiRoot}/`) : undefined;
+
+const gmailEndpoint = (auth: Auth.OAuth2Client): gmail_v1.Gmail =>
+  google.gmail({ version: "v1", auth, ...(API_ROOT ? { rootUrl: API_ROOT } : {}) });
+
 // Reuses google-mcp's OAuth client; override to point anywhere else.
 export const CREDENTIALS_PATH =
   process.env.GMAIL_MCP_CREDENTIALS || path.join(configDir, "google-mcp", "credentials.json");
@@ -169,12 +180,31 @@ export const removeAccount = async (email: string): Promise<void> => {
   store.delete(bearerKey(target));
 };
 
-// Full mailbox (needed for messages.delete / batchDelete / insert / import) plus settings.
-export const SCOPES = [
-  "https://mail.google.com/",
+// Fork scope policy: never request the full `mail.google.com` scope implicitly. These
+// cover read/organize (modify), labels, drafts and sending (compose), and settings.
+// Permanent delete, mailbox import/insert and raw send need the full scope, which this
+// fork only grants through an explicit GMAIL_MCP_SCOPES override — see ENABLE_DANGEROUS_TOOLS.
+const FORK_SCOPES = [
+  "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/gmail.labels",
+  "https://www.googleapis.com/auth/gmail.compose",
   "https://www.googleapis.com/auth/gmail.settings.basic",
   "https://www.googleapis.com/auth/gmail.settings.sharing",
 ];
+
+/**
+ * `gmail-mcp auth` requests GMAIL_MCP_SCOPES when set (comma or space separated URLs),
+ * otherwise FORK_SCOPES. Narrower stored tokens are fine: tools the token lacks scope
+ * for fail at Google with an actionable message, and the server's own tool gating keeps
+ * them off the tool list in the first place.
+ */
+export const resolveScopes = (override: string | undefined = process.env.GMAIL_MCP_SCOPES): string[] => {
+  const parsed = (override ?? "")
+    .split(/[,\s]+/)
+    .map((entry) => entry.trim())
+    .filter((entry) => /^https:\/\//.test(entry));
+  return parsed.length > 0 ? parsed : FORK_SCOPES;
+};
 
 const AUTH_TIMEOUT_MS = 5 * 60_000;
 /** Budget for post-consent network calls (profile lookup, token exchange) before giving up. */
@@ -285,7 +315,7 @@ export interface AuthorizeOptions {
 }
 
 const fetchProfileEmail = async (client: Auth.OAuth2Client): Promise<string> => {
-  const { data } = await google.gmail({ version: "v1", auth: client }).users.getProfile({ userId: "me" });
+  const { data } = await gmailEndpoint(client).users.getProfile({ userId: "me" });
   if (!data.emailAddress) throw new Error("Gmail getProfile returned no emailAddress");
   return data.emailAddress;
 };
@@ -332,7 +362,7 @@ const migrateLegacy = async (
 export const loadAccounts = async ({
   profile = fetchProfileEmail,
   legacyPaths = [TOKEN_PATH, SEED_TOKEN_PATH],
-  gmailFor = (auth) => google.gmail({ version: "v1", auth }),
+  gmailFor = (auth) => gmailEndpoint(auth),
   profileTimeoutMs = PROFILE_TIMEOUT_MS,
 }: LoadAccountsOptions = {}): Promise<LoadedAccounts | undefined> => {
   let emails = await listAccounts();
@@ -386,7 +416,7 @@ export const authorize = async ({
   const redirectUri = `http://127.0.0.1:${port}/oauth2callback`;
   const client = await createClient(redirectUri);
   const state = randomUUID();
-  const url = client.generateAuthUrl({ access_type: "offline", prompt: "consent select_account", scope: SCOPES, state });
+  const url = client.generateAuthUrl({ access_type: "offline", prompt: "consent select_account", scope: resolveScopes(), state });
 
   try {
     const code = await new Promise<string>((resolve, reject) => {

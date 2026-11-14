@@ -4,6 +4,7 @@ import type { gmail_v1 } from "googleapis";
 import { z } from "zod";
 import { registerTools } from "./tools.js";
 import type { Accounts } from "./tools.js";
+import type { Features } from "./config.js";
 
 // Records `users.messages.send` style paths and the single argument each call received.
 const recordingGmail = () => {
@@ -58,12 +59,19 @@ const invoke = async (t: Registered, args: Record<string, unknown>) =>
 describe("registerTools", () => {
   const amy = recordingGmail();
   const bob = recordingGmail();
+  // Fork: the sweep runs with every gate open (pull_push + all optional families), which
+  // registers the same full surface the upstream tests were written against. The gate
+  // behavior itself is asserted in the fork describes below.
+  const fullFeatures: Features = { mode: "pull_push", allowlist: ["b"], settingsTools: true, workspaceTools: true, dangerousTools: true };
   const accounts: Accounts = {
     clients: new Map([["amy@example.com", amy.gmail], ["bob@example.com", bob.gmail]]),
     default: "amy@example.com",
+    features: fullFeatures,
   };
   const tools = collect(accounts);
-  const accountTools = new Set(["gmail_list_accounts"]);
+  // Tools that legitimately contact Google more than once per invocation, plus the
+  // account listing tool, are checked in dedicated tests instead of the uniform sweeps.
+  const skipUniform = new Set(["gmail_list_accounts", "gmail_send_draft"]);
 
   it("registers all 80 users.* endpoints plus 1 account tool", () => {
     expect(tools.size).toBe(81);
@@ -72,7 +80,7 @@ describe("registerTools", () => {
 
   it("every tool reaches exactly one googleapis method with its required input and returns JSON text", async () => {
     for (const [name, t] of tools) {
-      if (accountTools.has(name)) continue;
+      if (skipUniform.has(name)) continue;
       amy.calls.length = 0;
       const result = await invoke(t, fill(t.shape));
       expect(amy.calls, name).toHaveLength(1);
@@ -83,7 +91,7 @@ describe("registerTools", () => {
 
   it("every Gmail tool accepts an optional account and, when omitted, calls the default account's client", async () => {
     for (const [name, t] of tools) {
-      if (accountTools.has(name)) continue;
+      if (skipUniform.has(name)) continue;
       expect(t.shape.account, name).toBeDefined();
       amy.calls.length = 0;
       bob.calls.length = 0;
@@ -124,7 +132,6 @@ describe("registerTools", () => {
     ["gmail_insert_message", { text: "hi", labelIds: ["INBOX"], deleted: false }, "users.messages.insert", (a: any) => a.requestBody.labelIds[0] === "INBOX" && a.deleted === false],
     ["gmail_modify_message", { id: "m", addLabelIds: ["STARRED"] }, "users.messages.modify", (a: any) => a.id === "m" && a.requestBody.addLabelIds[0] === "STARRED"],
     ["gmail_batch_delete_messages", { ids: ["a", "b"] }, "users.messages.batchDelete", (a: any) => a.requestBody.ids.length === 2],
-    ["gmail_send_draft", { id: "d" }, "users.drafts.send", (a: any) => a.requestBody.id === "d"],
     ["gmail_update_draft", { id: "d", userId: "u@x", text: "t" }, "users.drafts.update", (a: any) => a.userId === "u@x" && a.id === "d" && typeof a.requestBody.message.raw === "string"],
     ["gmail_create_filter", { criteria: { from: "x" }, action: { addLabelIds: ["L"] } }, "users.settings.filters.create", (a: any) => a.requestBody.criteria.from === "x"],
     ["gmail_patch_cse_identity", { emailAddress: "e", identity: { primaryKeyPairId: "k" } }, "users.settings.cse.identities.patch", (a: any) => a.emailAddress === "e" && a.requestBody.primaryKeyPairId === "k"],
@@ -174,7 +181,88 @@ describe("registerTools", () => {
     const failing = {
       users: { messages: { get: () => Promise.reject(Object.assign(new Error("invalid_grant"), { code: 400 })) }, settings: {} },
     } as unknown as gmail_v1.Gmail;
-    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com" }).get("gmail_get_message")!;
+    const t = collect({ clients: new Map([["amy@example.com", failing]]), default: "amy@example.com", features: fullFeatures }).get("gmail_get_message")!;
     await expect(invoke(t, { id: "m" })).rejects.toThrow(/amy@example\.com.*gmail-mcp auth/);
+  });
+});
+
+// ---- Fork: mode gating and the send allowlist ----
+
+// A fake whose messages.get returns real headers, so the send_draft guard reads them.
+const draftWithHeaders = (headers: { name: string; value: string }[], onSend: () => void) => {
+  const gmail = {
+    users: {
+      messages: {
+        get: async () => ({ data: { payload: { headers } } }),
+      },
+      drafts: {
+        send: async () => {
+          onSend();
+          return { data: { ok: true } };
+        },
+      },
+      settings: {},
+    },
+  };
+  return gmail as unknown as gmail_v1.Gmail;
+};
+
+describe("fork gating", () => {
+  const pullPush = (allowlist: string[]): Features => ({
+    mode: "pull_push",
+    allowlist,
+    settingsTools: false,
+    workspaceTools: false,
+    dangerousTools: false,
+  });
+
+  it("send_draft checks stored recipients against the allowlist, then sends", async () => {
+    let sent = false;
+    const draft = draftWithHeaders([{ name: "To", value: "friend@corp.com" }], () => { sent = true; });
+    const tools = collect({ clients: new Map([["amy@example.com", draft]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    await invoke(tools.get("gmail_send_draft")!, { id: "d" });
+    expect(sent).toBe(true);
+  });
+
+  it("send_draft refuses stored recipients outside the allowlist, before sending", async () => {
+    let sent = false;
+    const draft = draftWithHeaders(
+      [{ name: "To", value: "friend@corp.com, victim@gmail.com" }],
+      () => { sent = true; }
+    );
+    const tools = collect({ clients: new Map([["amy@example.com", draft]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    await expect(invoke(tools.get("gmail_send_draft")!, { id: "d" })).rejects.toThrow(/SEND_ALLOWLIST.*victim@gmail\.com/);
+    expect(sent).toBe(false);
+  });
+
+  it("send_message refuses outside recipients before touching Google", async () => {
+    const amy = recordingGmail();
+    const tools = collect({ clients: new Map([["amy@example.com", amy.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    await expect(
+      invoke(tools.get("gmail_send_message")!, { to: ["friend@corp.com", "stranger@gmail.com"], text: "hi" })
+    ).rejects.toThrow(/SEND_ALLOWLIST.*stranger@gmail\.com/);
+    expect(amy.calls).toHaveLength(0);
+  });
+
+  it("defaults to pull mode with every optional tool family off when features are omitted", () => {
+    const amy = recordingGmail();
+    const names = new Set(
+      collect({ clients: new Map([["amy@example.com", amy.gmail]]), default: "amy@example.com" }).keys()
+    );
+    for (const gated of [
+      "gmail_send_message", "gmail_send_raw", "gmail_send_draft", "gmail_create_draft", "gmail_update_draft",
+      "gmail_delete_message", "gmail_batch_delete_messages", "gmail_delete_thread", "gmail_insert_message",
+      "gmail_import_message", "gmail_update_vacation", "gmail_create_filter", "gmail_update_auto_forwarding",
+      "gmail_list_delegates", "gmail_insert_smime_info", "gmail_create_cse_keypair",
+    ]) {
+      expect(names.has(gated), gated).toBe(false);
+    }
+    for (const open of [
+      "gmail_list_messages", "gmail_get_message", "gmail_modify_message", "gmail_batch_modify_messages",
+      "gmail_trash_message", "gmail_list_labels", "gmail_create_label", "gmail_get_thread", "gmail_list_history",
+      "gmail_list_drafts", "gmail_get_draft", "gmail_get_attachment", "gmail_watch", "gmail_stop",
+    ]) {
+      expect(names.has(open), open).toBe(true);
+    }
   });
 });
