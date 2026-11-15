@@ -20,7 +20,10 @@ upstream documentation; start here for what changed.
   snapshot** (with the draft's `threadId`, so replies stay in their conversation)
   through `messages.send` — a concurrent draft edit cannot change what goes out. After
   a successful send the draft is consumed (mirroring Gmail's `drafts.send` lifecycle),
-  unless it was edited meanwhile — the edited version stays in Drafts. One recipient string may not
+  unless it was edited meanwhile — the edited version stays in Drafts. Known
+  limitation: the Gmail API has no conditional delete, so an edit saved in the few
+  milliseconds between the consumption check and the deletion would be consumed with
+  the draft; the sent message itself is always the validated snapshot. One recipient string may not
   smuggle several mailboxes past the check — every address in it must pass — and
   custom `headers` entries may not carry recipient headers (`To`, `Cc`, `Bcc`,
   `Resent-*`), and header names must be plain tokens (letters, digits, hyphens) —

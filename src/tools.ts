@@ -256,6 +256,14 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
         // Mirror Gmail's drafts.send lifecycle: a sent draft is consumed. Delete only
         // when it still holds exactly the snapshot that went out — concurrent edits
         // survive, and a failed cleanup never fails the already-successful send.
+        //
+        // Known residual race (inherent to the Gmail API, which has no conditional
+        // delete): an edit saved in the few milliseconds between the comparison read
+        // below and the delete call is consumed with the draft. The alternatives all
+        // lose something worse — skipping cleanup re-allows duplicate sends, deleting
+        // before sending loses the draft entirely when the send fails — so this window
+        // is accepted and documented (README: known limitations). What is sent is
+        // always byte-for-byte the validated snapshot regardless.
         try {
           const current = await gmail.users.drafts.get({ userId, id, format: "raw" });
           if (current.data.message?.raw === snapshot.raw) {
