@@ -57,6 +57,26 @@ const caller = (account: string): Call => async (fn) => {
  */
 const RECIPIENT_HEADERS = ["to", "cc", "bcc", "resent-to", "resent-cc", "resent-bcc"];
 
+/**
+ * Process-wide serialization for whole send/validate/consume sequences, keyed per
+ * mailbox + draft. One Node process hosts every MCP session, so a module-level lock
+ * covers same-session and cross-session overlap alike; overlapping calls of the same
+ * draft queue behind each other, different drafts proceed in parallel. (Multi-replica
+ * deployments would need a shared lock; this server is single-process.)
+ */
+const draftSendLocks = new Map<string, Promise<unknown>>();
+
+const withDraftLock = async <T>(key: string, run: () => Promise<T>): Promise<T> => {
+  const previous = draftSendLocks.get(key) ?? Promise.resolve();
+  const current = previous.catch(() => {}).then(run);
+  draftSendLocks.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (draftSendLocks.get(key) === current) draftSendLocks.delete(key);
+  }
+};
+
 const ids = {
   userId: z.string().default("me").describe("Mailbox; 'me' is the authenticated user"),
   account: z.string().optional().describe("Signed-in Gmail address to act as. Omit for this token's account."),
@@ -245,9 +265,9 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
         guardRecipients(c);
         return gmail.users.messages.send({ userId, requestBody: await rawMessage(c) });
       }));
-    tool("gmail_send_draft", "Send an existing draft. The stored message is validated against SEND_ALLOWLIST and sent exactly as validated (later edits do not affect what goes out); the draft is consumed afterwards unless it was edited meanwhile",
+    tool("gmail_send_draft", "Send an existing draft. The stored message is validated against SEND_ALLOWLIST and sent exactly as validated (later edits do not affect what goes out); the draft is consumed afterwards unless it was edited meanwhile. Overlapping sends of the same draft are serialized",
       { ...ids, id: z.string() },
-      ({ userId, id }, gmail, call) => call(async () => {
+      ({ userId, id }, gmail, call) => call(() => withDraftLock(`${userId}:${id}`, async () => {
         const snapshot = await validatedDraftRaw(gmail, userId, id);
         const { data } = await gmail.users.messages.send({
           userId,
@@ -275,7 +295,7 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
           console.error(`gmail-mcp: sent draft ${id} but could not consume it:`, err);
         }
         return { data };
-      }));
+      })));
   }
   tool("gmail_modify_message", "Add/remove labels on a message (read/unread, star, archive, custom and classification labels)",
     { ...ids, id: z.string(), addLabelIds: z.array(z.string()).optional(), removeLabelIds: z.array(z.string()).optional(), ...classification },

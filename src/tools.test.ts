@@ -194,7 +194,7 @@ describe("registerTools", () => {
 // whatever the test mutated it to (concurrent-edit simulation), delete consumes it.
 // The guard must fetch via users.drafts.get (draft ids are not message ids) and hand
 // the validated snapshot to users.messages.send — no drafts.send, no messages.get.
-const draftFake = (rfc822: string, onSend: (raw: string, threadId?: string) => void) => {
+const draftFake = (rfc822: string, onSend: (raw: string, threadId?: string) => void, holdGet?: () => Promise<void>) => {
   let stored = rfc822;
   let deleted = false;
   let gets = 0;
@@ -202,6 +202,7 @@ const draftFake = (rfc822: string, onSend: (raw: string, threadId?: string) => v
     users: {
       drafts: {
         get: async () => {
+          if (holdGet) await holdGet();
           gets += 1;
           if (deleted) throw Object.assign(new Error("no such draft"), { response: { status: 404 } });
           const raw = gets === 1 ? rfc822 : stored;
@@ -286,6 +287,26 @@ describe("fork gating", () => {
     await expect(invoke(tools.get("gmail_send_draft")!, { id: "d" })).rejects.toThrow(/SEND_ALLOWLIST.*victim@gmail\.com/);
     expect(sent).toBe(false);
     expect(fake.wasDeleted()).toBe(false);
+  });
+
+  it("serializes overlapping sends of the same draft so it cannot go out twice", async () => {
+    let sends = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const fake = draftFake("To: friend@corp.com\r\n\r\nbody", () => { sends += 1; }, () => gate);
+    const tools = collect({ clients: new Map([["amy@example.com", fake.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+
+    const first = invoke(tools.get("gmail_send_draft")!, { id: "d" });
+    const second = invoke(tools.get("gmail_send_draft")!, { id: "d" }); // overlaps the in-flight first call
+    release();
+    const [r1, r2] = await Promise.allSettled([first, second]);
+
+    expect(sends).toBe(1); // the lock held the second call until the draft was consumed
+    const fulfilled = r1.status === "fulfilled" ? r1 : r2;
+    const rejected = r1.status === "rejected" ? r1 : r2;
+    expect(fulfilled.status).toBe("fulfilled");
+    expect(rejected.status).toBe("rejected");
+    expect((rejected.reason as Error).message).toMatch(/could not find that resource/);
   });
 
   it("send_draft ignores a To: line inside the body and refuses Resent-* headers", async () => {
