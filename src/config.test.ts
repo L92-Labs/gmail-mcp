@@ -49,9 +49,9 @@ describe("parseConfig", () => {
     expect(parseConfig({ DEFAULT_EMAIL_ACCOUNT: "  Bob@Example.COM " }).defaultAccount).toBe("bob@example.com");
   });
 
-  it("parses extra hosts and strips ports", () => {
+  it("keeps port-bearing proxy hosts exact and lowercases the rest", () => {
     expect(parseConfig({ MCP_ALLOWED_HOSTS: "Mail.Example.com:8443, alt.example.com" }).extraHosts).toEqual([
-      "mail.example.com",
+      "mail.example.com:8443",
       "alt.example.com",
     ]);
     expect(() => parseConfig({ MCP_ALLOWED_HOSTS: " , " })).toThrow(/MCP_ALLOWED_HOSTS/);
@@ -126,6 +126,22 @@ describe("parseConfig", () => {
 describe("recipientAllowed", () => {
   const allowlist = ["corp.com", "boss@personal.example", "exact@corp.com"];
 
+  it("validates every mailbox inside one comma-separated string", () => {
+    expect(recipientAllowed("friend@corp.com, other@corp.com", allowlist)).toBe(true);
+    expect(recipientAllowed("outsider@evil.test, friend@corp.com", allowlist)).toBe(false);
+    expect(recipientAllowed("friend@corp.com, exact@corp.com", allowlist)).toBe(true);
+  });
+
+  it("validates display-name forms by the address after the last @", () => {
+    expect(recipientAllowed("Bob Smith <friend@corp.com>", allowlist)).toBe(true);
+    expect(recipientAllowed("Bob <friend@corp.com>, Eve <evil@test.io>", allowlist)).toBe(false);
+  });
+
+  it("fails closed on segments without an @", () => {
+    expect(recipientAllowed("not-an-address", allowlist)).toBe(false);
+    expect(recipientAllowed("friend@corp.com, garbage", allowlist)).toBe(false);
+  });
+
   it("matches exact addresses and domain entries", () => {
     expect(recipientAllowed("boss@personal.example", allowlist)).toBe(true);
     expect(recipientAllowed("anyone@corp.com", allowlist)).toBe(true);
@@ -150,7 +166,7 @@ describe("recipientAllowed", () => {
   });
 
   it("handles recipients without an @ defensively", () => {
-    expect(recipientAllowed("corp.com", ["corp.com"])).toBe(true);
+    expect(recipientAllowed("corp.com", ["corp.com"])).toBe(false);
     expect(recipientAllowed("nowhere", ["corp.com"])).toBe(false);
   });
 });

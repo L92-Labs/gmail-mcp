@@ -44,6 +44,13 @@ const caller = (account: string): Call => async (fn) => {
   }
 };
 
+/**
+ * Headers that carry recipients. A caller could smuggle recipients past the to/cc/bcc
+ * checks through custom `headers` (buildRaw copies them verbatim), so the send guards
+ * treat these names specially.
+ */
+const RECIPIENT_HEADERS = ["to", "cc", "bcc", "resent-to", "resent-cc", "resent-bcc"];
+
 const ids = {
   userId: z.string().default("me").describe("Mailbox; 'me' is the authenticated user"),
   account: z.string().optional().describe("Signed-in Gmail address to act as. Omit for this token's account."),
@@ -156,31 +163,51 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     // sending anywhere the operator did not allow. parseConfig guarantees a non-empty
     // allowlist for pull_push, but refuse closed if one is missing anyway.
     const allowed = recipientAllowedBy(features.allowlist);
-    const guardRecipients = (c: { to?: string[]; cc?: string[]; bcc?: string[] }): void => {
-      const refused = [...(c.to ?? []), ...(c.cc ?? []), ...(c.bcc ?? [])].filter((r) => !allowed(r));
+    const guardRecipients = (c: {
+      to?: string[];
+      cc?: string[];
+      bcc?: string[];
+      headers?: Record<string, string>;
+    }): void => {
+      const recipients = [...(c.to ?? []), ...(c.cc ?? []), ...(c.bcc ?? [])];
+      const refused = recipients.filter((r) => !allowed(r));
       if (refused.length > 0) {
         throw new Error(
           `Send refused by SEND_ALLOWLIST. Not allowed: ${refused.join(", ")}. ` +
             `Allowed: ${features.allowlist.join(", ")}.`
         );
       }
-    };
-    /** Pulls To/Cc/Bcc out of a stored message's headers so drafts are guarded too. */
-    const guardStoredRecipients = async (gmail: Gmail, userId: string, messageId: string): Promise<void> => {
-      const { data } = await gmail.users.messages.get({ userId, id: messageId, format: "metadata",
-        metadataHeaders: ["To", "Cc", "Bcc"] });
-      const headers = data.payload?.headers ?? [];
-      const value = (name: string) => headers.find((h) => h.name?.toLowerCase() === name)?.value ?? "";
-      const recipients = ["to", "cc", "bcc"]
-        .flatMap((name) => (value(name) || "").split(","))
-        .map((r) => r.trim())
-        .filter(Boolean);
-      const refused = recipients.filter((r) => !allowed(r));
-      if (refused.length > 0) {
+      // Recipient headers inside `headers` would bypass the array checks above; refuse
+      // them so every recipient travels through to/cc/bcc where it is validated.
+      const smuggled = Object.keys(c.headers ?? {}).filter((name) =>
+        RECIPIENT_HEADERS.includes(name.toLowerCase())
+      );
+      if (smuggled.length > 0) {
         throw new Error(
-          `Send refused by SEND_ALLOWLIST (draft recipients). Not allowed: ${refused.join(", ")}. ` +
-            `Allowed: ${features.allowlist.join(", ")}.`
+          `Send refused: "headers" must not carry recipient headers (${smuggled.join(", ")}); ` +
+            "use to/cc/bcc so SEND_ALLOWLIST can check every recipient."
         );
+      }
+      if (recipients.length === 0) throw new Error("Send refused: no recipients given");
+    };
+    /**
+     * Reads recipient headers out of the stored DRAFT. Draft ids are not message ids,
+     * so this must go through users.drafts.get; every header value is validated the
+     * same way as the to/cc/bcc arrays.
+     */
+    const guardStoredRecipients = async (gmail: Gmail, userId: string, draftId: string): Promise<void> => {
+      const { data } = await gmail.users.drafts.get({ userId, id: draftId, format: "metadata" });
+      const headers = data.message?.payload?.headers ?? [];
+      for (const name of RECIPIENT_HEADERS) {
+        const raw = headers.find((h) => h.name?.toLowerCase() === name)?.value ?? "";
+        if (!raw) continue;
+        const refused = raw.split(",").map((r) => r.trim()).filter(Boolean).filter((r) => !allowed(r));
+        if (refused.length > 0) {
+          throw new Error(
+            `Send refused by SEND_ALLOWLIST (draft ${name} header). Not allowed: ${refused.join(", ")}. ` +
+              `Allowed: ${features.allowlist.join(", ")}.`
+          );
+        }
       }
     };
     tool("gmail_send_message", "Compose and send an email with optional attachments. Recipients must match SEND_ALLOWLIST",

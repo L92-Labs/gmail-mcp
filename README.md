@@ -14,9 +14,13 @@ upstream documentation; start here for what changed.
   signed-in account, tools take `account` to pick a mailbox (needs 32+ chars). Unset =
   upstream per-account bearer behavior, unchanged.
 - `SEND_ALLOWLIST` — recipient guard enforced inside every send tool, including
-  `gmail_send_draft` (stored draft recipients are fetched and checked before sending).
-  `gmail_send_raw` bypasses the allowlist, so it only exists behind
-  `ENABLE_DANGEROUS_TOOLS`.
+  `gmail_send_draft` (stored draft recipients are fetched via `users.drafts.get` and
+  every recipient header is validated before sending). One recipient string may not
+  smuggle several mailboxes past the check — every address in it must pass — and
+  custom `headers` entries may not carry recipient headers (`To`, `Cc`, `Bcc`,
+  `Resent-*`); use `to`/`cc`/`bcc` so the allowlist can see them. Recipient strings
+  without an `@` fail closed. `gmail_send_raw` bypasses the allowlist, so it only
+  exists behind `ENABLE_DANGEROUS_TOOLS`.
 - Narrow OAuth scopes: `gmail-mcp auth` never requests `https://mail.google.com/`.
   Permanent delete, mailbox import/insert and raw send additionally require
   `GMAIL_MCP_SCOPES` to grant the full scope explicitly. `gmail_modify`/`compose`/
@@ -39,7 +43,7 @@ upstream documentation; start here for what changed.
 | `ENABLE_SETTINGS_TOOLS` | `false` | vacation, IMAP/POP, language, filters, forwarding, send-as |
 | `ENABLE_WORKSPACE_TOOLS` | `false` | delegates, S/MIME, CSE (dead on consumer accounts) |
 | `ENABLE_DANGEROUS_TOOLS` | `false` | permanent delete, raw send, insert/import — also needs explicit full scope |
-| `MCP_ALLOWED_HOSTS` | loopback | extra allowed `Host` values (tunnels, proxies) |
+| `MCP_ALLOWED_HOSTS` | loopback | extra allowed `Host` values (tunnels, proxies); `host:port` entries match exactly |
 | `GMAIL_MCP_SCOPES` | derived | explicit scope override (comma/space separated URLs) |
 | `GMAIL_MCP_API_ROOT` | googleapis | Gmail REST root override (test doubles) |
 

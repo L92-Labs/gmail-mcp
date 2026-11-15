@@ -218,4 +218,12 @@ describe("extra hosts enter the rebinding allowlist", () => {
       expect(h.allowedHosts.some((entry) => entry.startsWith("gmail.example.com:"))).toBe(true);
     } finally { h.close(); }
   });
+
+  it("keeps port-bearing proxy entries exact instead of rewriting them", async () => {
+    const h = await boot({ accounts: accounts({ [AMY]: "t1" }), extraHosts: ["mail.example.com:8443"] });
+    try {
+      expect(h.allowedHosts).toContain("mail.example.com:8443");
+      expect(h.allowedHosts).not.toContain("mail.example.com");
+    } finally { h.close(); }
+  });
 });

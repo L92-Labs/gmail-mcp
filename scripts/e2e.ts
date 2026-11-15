@@ -50,10 +50,10 @@ const ok = (label: string, condition: boolean, detail?: unknown): void => {
 
 // ---- fake Gmail REST API --------------------------------------------------
 
-interface FakeState { sentTo: string[]; drafts: number }
+interface FakeState { sentTo: string[]; drafts: Map<string, string> }
 
 const startFakeGmail = async (): Promise<{ port: number; close: () => void; state: FakeState }> => {
-  const state: FakeState = { sentTo: [], drafts: 0 };
+  const state: FakeState = { sentTo: [], drafts: new Map() };
   const json = (res: ServerResponse, body: unknown, status = 200): void => {
     res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
   };
@@ -87,8 +87,30 @@ const startFakeGmail = async (): Promise<{ port: number; close: () => void; stat
       return json(res, { drafts: [], resultSizeEstimate: 0 });
     }
     if (req.method === "POST" && me === "drafts") {
-      state.drafts += 1;
-      return json(res, { id: `draft-${state.drafts}`, message: { id: `m-draft-${state.drafts}` } });
+      const body = await readBody(req);
+      // drafts.create wraps the RFC 822 source in {message:{raw}}; send puts raw at top level.
+      const source = (body.message as { raw?: string } | undefined)?.raw ?? body.raw;
+      const raw = Buffer.from(String(source ?? ""), "base64url").toString("utf8");
+      const to = [...raw.matchAll(/^To:\s*(.+)$/gim)].map((m) => m[1]!.trim()).join(", ");
+      const id = `draft-${state.drafts.size + 1}`;
+      // Draft ids are distinct from message ids on purpose: the server must resolve
+      // recipients through users.drafts.get, not users.messages.get.
+      state.drafts.set(id, to);
+      return json(res, { id, message: { id: `m-for-${id}` } });
+    }
+    if (req.method === "POST" && me === "drafts/send") {
+      // Gmail API shape: the draft id travels in the request body, not the path.
+      const body = await readBody(req);
+      const to = state.drafts.get(String(body.id ?? ""));
+      if (to === undefined) return json(res, { error: { code: 404, message: "no such draft" } }, 404);
+      state.sentTo.push(...to.split(",").map((a) => a.trim()).filter(Boolean));
+      return json(res, { id: `sent-${state.sentTo.length}`, labelIds: ["SENT"] });
+    }
+    const draftGet = me.match(/^drafts\/([^/]+)$/);
+    if (req.method === "GET" && draftGet) {
+      const to = state.drafts.get(draftGet[1]!);
+      if (to === undefined) return json(res, { error: { code: 404, message: "no such draft" } }, 404);
+      return json(res, { id: draftGet[1], message: { payload: { headers: [{ name: "To", value: to }] } } });
     }
     if (req.method === "GET" && me === "labels") {
       return json(res, { labels: [{ id: "INBOX", name: "INBOX", type: "system" }, { id: "Label_1", name: "Receipts", type: "user" }] });
@@ -271,6 +293,20 @@ const main = async (): Promise<number> => {
       const refused = await call(client, "gmail_send_message", { to: ["friend@corp.com", "stranger@gmail.com"], subject: "s", text: "body" });
       ok("send outside the allowlist is refused at the tool boundary", refused.isError && refused.text.includes("SEND_ALLOWLIST") && refused.text.includes("stranger@gmail.com"), refused);
       ok("refused recipients never reach the API", !fake.state.sentTo.includes("stranger@gmail.com"), fake.state.sentTo);
+
+      const goodDraft = await call(client, "gmail_create_draft", { to: ["corpfriend@corp.com"], subject: "s", text: "b" });
+      ok("create_draft reaches the API", !goodDraft.isError, goodDraft);
+      const draftId = (JSON.parse(goodDraft.text) as { id?: string }).id ?? "";
+      const sentDraft = await call(client, "gmail_send_draft", { id: draftId });
+      ok("send_draft resolves the draft and delivers to its stored recipient",
+        !sentDraft.isError && fake.state.sentTo.includes("corpfriend@corp.com"), sentDraft);
+
+      const badDraft = await call(client, "gmail_create_draft", { to: ["undercover@gmail.com"], subject: "s", text: "b" });
+      const badId = (JSON.parse(badDraft.text) as { id?: string }).id ?? "";
+      const refusedDraft = await call(client, "gmail_send_draft", { id: badId });
+      ok("send_draft refuses a draft whose stored recipient is outside the allowlist",
+        refusedDraft.isError && refusedDraft.text.includes("SEND_ALLOWLIST") && refusedDraft.text.includes("undercover@gmail.com"), refusedDraft);
+      ok("refused drafts never reach the API", !fake.state.sentTo.includes("undercover@gmail.com"), fake.state.sentTo);
     } finally { await stop(c); }
 
     // ---- Leg D: per-account bearers (upstream compat) -------------------

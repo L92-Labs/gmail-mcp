@@ -111,7 +111,13 @@ export const createRequestHandler = ({
   // The SDK compares the raw Host header, so list each name with and without the port.
   // Extra hosts serve tunnel/proxy frontends (e.g. a Cloudflare tunnel hostname);
   // anything else is a DNS-rebinding attempt.
-  const allowedHosts = [...new Set([host, ...extraHosts, "127.0.0.1", "localhost", "[::1]"])].flatMap((h) => [h, `${h}:${port}`]);
+  const loopbackAndHost = [...new Set([host, "127.0.0.1", "localhost", "[::1]"])].flatMap((h) => [h, `${h}:${port}`]);
+  // A port-bearing extra host matches exactly; a bare hostname also matches the
+  // server's own port, mirroring the loopback entries.
+  const allowedHosts = [
+    ...loopbackAndHost,
+    ...extraHosts.flatMap((h) => (/:\d+$/.test(h) ? [h] : [h, `${h}:${port}`])),
+  ];
 
   const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const url = new URL(req.url ?? "/", "http://localhost");

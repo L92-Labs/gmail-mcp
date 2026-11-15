@@ -49,13 +49,24 @@ const list = (raw: string | undefined): string[] =>
     .map((entry) => entry.trim().toLowerCase())
     .filter(Boolean);
 
-/** Exact address or bare domain; a domain entry also matches its subdomains. */
+/**
+ * Every mailbox represented by `recipient` must pass: one string may carry several
+ * addresses ("a@x.test, b@y.test") and display-name forms are fine. A segment without
+ * an @ fails closed rather than guessing a domain. Allowlist entry forms: exact
+ * address, or bare domain (subdomains match).
+ */
 export const recipientAllowed = (recipient: string, allowlist: string[]): boolean => {
-  const at = recipient.trim().toLowerCase().lastIndexOf("@");
-  if (at < 0) return allowlist.includes(recipient.trim().toLowerCase());
-  const address = recipient.trim().toLowerCase();
-  const domain = address.slice(at + 1);
-  return allowlist.some((entry) => entry === address || domain === entry || domain.endsWith(`.${entry}`));
+  const parts = recipient.split(",").map((part) => part.trim().toLowerCase()).filter(Boolean);
+  if (parts.length === 0) return false;
+  return parts.every((part) => {
+    // Display-name form: keep only the address inside the angle brackets.
+    const bracket = part.match(/<([^>]*)>/);
+    const mailbox = (bracket ? bracket[1] : part).trim();
+    const at = mailbox.lastIndexOf("@");
+    if (at < 0) return false;
+    const domain = mailbox.slice(at + 1);
+    return allowlist.some((entry) => mailbox === entry || domain === entry || domain.endsWith(`.${entry}`));
+  });
 };
 
 export const recipientAllowedBy = (allowlist: string[]) => (recipient: string): boolean =>
@@ -112,7 +123,9 @@ export const parseConfig = (
     errors.push("MCP_BEARER_TOKEN must have at least 32 characters (openssl rand -hex 32)");
   }
 
-  const extraHosts = list(env.MCP_ALLOWED_HOSTS).map((entry) => entry.replace(/:\d+$/, ""));
+  // Port-bearing entries stay exact ("example.com:8443"); bare hostnames are widened
+  // with the server's listening port by the request handler.
+  const extraHosts = list(env.MCP_ALLOWED_HOSTS);
   if (env.MCP_ALLOWED_HOSTS && extraHosts.length === 0) {
     errors.push('MCP_ALLOWED_HOSTS is set but parsed to nothing; use comma-separated hostnames like "mail.example.com"');
   }

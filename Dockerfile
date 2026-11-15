@@ -1,7 +1,7 @@
 # Build with pnpm, ship dist + prod deps only. Runtime has no build tooling.
 FROM node:24-alpine AS build
 WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN corepack enable pnpm && corepack pnpm fetch
 COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src

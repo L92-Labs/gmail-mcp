@@ -71,7 +71,9 @@ describe("registerTools", () => {
   const tools = collect(accounts);
   // Tools that legitimately contact Google more than once per invocation, plus the
   // account listing tool, are checked in dedicated tests instead of the uniform sweeps.
-  const skipUniform = new Set(["gmail_list_accounts", "gmail_send_draft"]);
+  // send_message joins them: its allowlist guard rejects empty recipient sets, so the
+  // generic fill() sweep cannot drive it; dedicated tests cover it instead.
+  const skipUniform = new Set(["gmail_list_accounts", "gmail_send_draft", "gmail_send_message"]);
 
   it("registers all 80 users.* endpoints plus 1 account tool", () => {
     expect(tools.size).toBe(81);
@@ -188,14 +190,14 @@ describe("registerTools", () => {
 
 // ---- Fork: mode gating and the send allowlist ----
 
-// A fake whose messages.get returns real headers, so the send_draft guard reads them.
+// A fake whose drafts.get returns real headers, so the send_draft guard reads them.
+// The guard must fetch via users.drafts.get (draft ids are not message ids), so the
+// fake deliberately exposes no messages.get at all.
 const draftWithHeaders = (headers: { name: string; value: string }[], onSend: () => void) => {
   const gmail = {
     users: {
-      messages: {
-        get: async () => ({ data: { payload: { headers } } }),
-      },
       drafts: {
+        get: async () => ({ data: { id: "d", message: { payload: { headers } } } }),
         send: async () => {
           onSend();
           return { data: { ok: true } };
@@ -233,6 +235,24 @@ describe("fork gating", () => {
     const tools = collect({ clients: new Map([["amy@example.com", draft]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
     await expect(invoke(tools.get("gmail_send_draft")!, { id: "d" })).rejects.toThrow(/SEND_ALLOWLIST.*victim@gmail\.com/);
     expect(sent).toBe(false);
+  });
+
+  it("send_message refuses recipient headers smuggled through custom headers", async () => {
+    const amy = recordingGmail();
+    const tools = collect({ clients: new Map([["amy@example.com", amy.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    await expect(
+      invoke(tools.get("gmail_send_message")!, { to: ["friend@corp.com"], text: "hi", headers: { To: "outsider@evil.test" } })
+    ).rejects.toThrow(/headers.*must not carry recipient headers/i);
+    expect(amy.calls).toHaveLength(0);
+  });
+
+  it("send_message refuses recipient headers even when arrays are absent", async () => {
+    const amy = recordingGmail();
+    const tools = collect({ clients: new Map([["amy@example.com", amy.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    await expect(
+      invoke(tools.get("gmail_send_message")!, { text: "hi", headers: { "Resent-To": "boss@corp.com" } })
+    ).rejects.toThrow(/resent-to/i);
+    expect(amy.calls).toHaveLength(0);
   });
 
   it("send_message refuses outside recipients before touching Google", async () => {
