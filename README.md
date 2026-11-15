@@ -14,8 +14,11 @@ upstream documentation; start here for what changed.
   signed-in account, tools take `account` to pick a mailbox (needs 32+ chars). Unset =
   upstream per-account bearer behavior, unchanged.
 - `SEND_ALLOWLIST` — recipient guard enforced inside every send tool, including
-  `gmail_send_draft` (stored draft recipients are fetched via `users.drafts.get` and
-  every recipient header is validated before sending). One recipient string may not
+  `gmail_send_draft`, which fetches the draft's full RFC 822 source via
+  `users.drafts.get`, validates every recipient header (quoted display names and
+  folded headers included, header block only), and then sends **exactly that validated
+  snapshot** through `messages.send` — a concurrent draft edit cannot change what goes
+  out. One recipient string may not
   smuggle several mailboxes past the check — every address in it must pass — and
   custom `headers` entries may not carry recipient headers (`To`, `Cc`, `Bcc`,
   `Resent-*`), and header names must be plain tokens (letters, digits, hyphens) —

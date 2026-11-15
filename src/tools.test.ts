@@ -190,17 +190,23 @@ describe("registerTools", () => {
 
 // ---- Fork: mode gating and the send allowlist ----
 
-// A fake whose drafts.get returns real headers, so the send_draft guard reads them.
-// The guard must fetch via users.drafts.get (draft ids are not message ids), so the
-// fake deliberately exposes no messages.get at all.
-const draftWithHeaders = (headers: { name: string; value: string }[], onSend: () => void) => {
+// A fake whose drafts.get returns the raw RFC 822 source, so the send_draft guard
+// validates and forwards the exact snapshot. The guard must fetch via users.drafts.get
+// (draft ids are not message ids) and hand the SAME raw to users.messages.send — the
+// fake exposes no drafts.send and no messages.get, so any other path fails.
+const draftWithRaw = (rfc822: string, onSend: (raw: string) => void) => {
   const gmail = {
     users: {
       drafts: {
-        get: async () => ({ data: { id: "d", message: { payload: { headers } } } }),
-        send: async () => {
-          onSend();
-          return { data: { ok: true } };
+        get: async () => ({
+          data: { id: "d", message: { raw: Buffer.from(rfc822, "utf8").toString("base64url"), threadId: "t1" } },
+        }),
+      },
+      messages: {
+        send: async (args: { requestBody: { raw?: string } }) => {
+          const raw = Buffer.from(args.requestBody.raw ?? "", "base64url").toString("utf8");
+          onSend(raw);
+          return { data: { id: "sent-1", labelIds: ["SENT"] } };
         },
       },
       settings: {},
@@ -218,9 +224,21 @@ describe("fork gating", () => {
     dangerousTools: false,
   });
 
-  it("send_draft checks stored recipients against the allowlist, then sends", async () => {
+  it("send_draft validates the stored snapshot and sends those exact bytes", async () => {
+    let sentRaw = "";
+    const source = "To: friend@corp.com\r\nSubject: hi\r\n\r\nbody";
+    const draft = draftWithRaw(source, (raw) => { sentRaw = raw; });
+    const tools = collect({ clients: new Map([["amy@example.com", draft]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    await invoke(tools.get("gmail_send_draft")!, { id: "d" });
+    // Bound to the validated snapshot: the outgoing raw is byte-identical to what was
+    // checked, so a concurrent update_draft cannot change what goes out.
+    expect(sentRaw).toBe(source);
+  });
+
+  it("send_draft understands quoted display names and folded recipient headers", async () => {
     let sent = false;
-    const draft = draftWithHeaders([{ name: "To", value: "friend@corp.com" }], () => { sent = true; });
+    const source = 'To: "Doe, Jane" <jane@corp.com>\r\nCc: one@corp.com,\r\n two@corp.com\r\n\r\nbody';
+    const draft = draftWithRaw(source, () => { sent = true; });
     const tools = collect({ clients: new Map([["amy@example.com", draft]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
     await invoke(tools.get("gmail_send_draft")!, { id: "d" });
     expect(sent).toBe(true);
@@ -228,13 +246,24 @@ describe("fork gating", () => {
 
   it("send_draft refuses stored recipients outside the allowlist, before sending", async () => {
     let sent = false;
-    const draft = draftWithHeaders(
-      [{ name: "To", value: "friend@corp.com, victim@gmail.com" }],
-      () => { sent = true; }
-    );
+    const draft = draftWithRaw("To: friend@corp.com, victim@gmail.com\r\n\r\nbody", () => { sent = true; });
     const tools = collect({ clients: new Map([["amy@example.com", draft]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
     await expect(invoke(tools.get("gmail_send_draft")!, { id: "d" })).rejects.toThrow(/SEND_ALLOWLIST.*victim@gmail\.com/);
     expect(sent).toBe(false);
+  });
+
+  it("send_draft ignores a To: line inside the body and refuses Resent-* headers", async () => {
+    const trick = "To: friend@corp.com\r\n\r\nignore this line please\r\nTo: victim@gmail.com\r\n";
+    let sent = false;
+    const draft = draftWithRaw(trick, () => { sent = true; });
+    const tools = collect({ clients: new Map([["amy@example.com", draft]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    await invoke(tools.get("gmail_send_draft")!, { id: "d" });
+    expect(sent).toBe(true); // the body line is not a recipient header
+
+    const resent = draftWithRaw("Resent-To: outsider@evil.test\r\nTo: friend@corp.com\r\n\r\nbody", () => { sent = true; });
+    const tools2 = collect({ clients: new Map([["amy@example.com", resent]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    await expect(invoke(tools2.get("gmail_send_draft")!, { id: "d" })).rejects.toThrow(/Resent-/);
+    expect(sent).toBe(true); // unchanged by the refused call
   });
 
   it("send_message refuses recipient headers smuggled through custom headers", async () => {

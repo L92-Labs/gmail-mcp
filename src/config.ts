@@ -77,13 +77,36 @@ const segmentAllowed = (part: string, allowlist: string[]): boolean => {
 };
 
 /**
+ * Splits a recipient list on commas that are not inside a quoted display name
+ * ('"Doe, Jane" <jane@x.test>' stays one entry). Lowercases and drops empties.
+ */
+export const splitRecipients = (recipient: string): string[] => {
+  const parts: string[] = [];
+  let current = "";
+  let quoted = false;
+  for (const char of recipient) {
+    if (char === '"') {
+      quoted = !quoted;
+      current += char;
+    } else if (char === "," && !quoted) {
+      parts.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  parts.push(current);
+  return parts.map((part) => part.trim().toLowerCase()).filter(Boolean);
+};
+
+/**
  * Every mailbox represented by `recipient` must pass: one string may carry several
  * addresses ("a@x.test, b@y.test" or several <addr> forms) and display names are fine
  * as long as no @ sits outside the brackets. Allowlist entry forms: exact address, or
  * bare domain (subdomains match).
  */
 export const recipientAllowed = (recipient: string, allowlist: string[]): boolean => {
-  const parts = recipient.split(",").map((part) => part.trim().toLowerCase()).filter(Boolean);
+  const parts = splitRecipients(recipient);
   if (parts.length === 0) return false;
   return parts.every((part) => segmentAllowed(part, allowlist));
 };

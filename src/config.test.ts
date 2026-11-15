@@ -151,6 +151,12 @@ describe("recipientAllowed", () => {
     expect(recipientAllowed("evil@test.io Bob <friend@corp.com>", allowlist)).toBe(false);
   });
 
+  it("keeps quoted display-name commas as one recipient", () => {
+    expect(recipientAllowed('"Doe, Jane" <jane@corp.com>', allowlist)).toBe(true);
+    expect(recipientAllowed('"Doe, Jane" <jane@evil.test>', allowlist)).toBe(false);
+    expect(recipientAllowed('a@corp.com, "B, C" <b@corp.com>', allowlist)).toBe(true);
+  });
+
   it("fails closed on segments without an @", () => {
     expect(recipientAllowed("not-an-address", allowlist)).toBe(false);
     expect(recipientAllowed("friend@corp.com, garbage", allowlist)).toBe(false);

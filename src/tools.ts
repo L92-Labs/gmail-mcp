@@ -6,7 +6,7 @@ import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sd
 import type { gmail_v1 } from "googleapis";
 import { z } from "zod";
 import { normalizeEmail, unknownAccountError } from "./auth.js";
-import { recipientAllowedBy, type Features } from "./config.js";
+import { recipientAllowedBy, splitRecipients, type Features } from "./config.js";
 import { buildRaw, parseMessage } from "./mime.js";
 
 type Gmail = gmail_v1.Gmail;
@@ -204,24 +204,35 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
       if (recipients.length === 0) throw new Error("Send refused: no recipients given");
     };
     /**
-     * Reads recipient headers out of the stored DRAFT. Draft ids are not message ids,
-     * so this must go through users.drafts.get; every header value is validated the
-     * same way as the to/cc/bcc arrays.
+     * Fetches the draft's full RFC 822 source and validates it. The returned raw is the
+     * exact snapshot that is sent afterwards — never the mutable draft id — so a
+     * concurrent update_draft cannot swap recipients between validation and send.
      */
-    const guardStoredRecipients = async (gmail: Gmail, userId: string, draftId: string): Promise<void> => {
-      const { data } = await gmail.users.drafts.get({ userId, id: draftId, format: "metadata" });
-      const headers = data.message?.payload?.headers ?? [];
-      for (const name of RECIPIENT_HEADERS) {
-        const raw = headers.find((h) => h.name?.toLowerCase() === name)?.value ?? "";
-        if (!raw) continue;
-        const refused = raw.split(",").map((r) => r.trim()).filter(Boolean).filter((r) => !allowed(r));
-        if (refused.length > 0) {
-          throw new Error(
-            `Send refused by SEND_ALLOWLIST (draft ${name} header). Not allowed: ${refused.join(", ")}. ` +
-              `Allowed: ${features.allowlist.join(", ")}.`
-          );
-        }
+    const validatedDraftRaw = async (gmail: Gmail, userId: string, draftId: string): Promise<string> => {
+      const { data } = await gmail.users.drafts.get({ userId, id: draftId, format: "raw" });
+      const raw = data.message?.raw ?? "";
+      const decoded = Buffer.from(raw, "base64url").toString("utf8");
+      // Only the header block decides recipients; a "To:" line in the body must not count.
+      const headerBlock = decoded.split(/\r?\n\r?\n/, 1)[0] ?? "";
+      const unfolded = headerBlock.replace(/\r?\n[ \t]+/g, " "); // unfold folded headers
+      if (/^Resent-(?:To|Cc|Bcc):/im.test(unfolded)) {
+        throw new Error(
+          "Send refused: the draft carries Resent-* recipient headers, which SEND_ALLOWLIST cannot vouch for."
+        );
       }
+      const refused: string[] = [];
+      for (const name of ["To", "Cc", "Bcc"]) {
+        const line = unfolded.match(new RegExp(`^${name}:[ \\t]*(.*)$`, "im"));
+        if (!line) continue;
+        refused.push(...splitRecipients(line[1]!).filter((r) => !allowed(r)));
+      }
+      if (refused.length > 0) {
+        throw new Error(
+          `Send refused by SEND_ALLOWLIST (draft recipients). Not allowed: ${refused.join(", ")}. ` +
+            `Allowed: ${features.allowlist.join(", ")}.`
+        );
+      }
+      return raw;
     };
     tool("gmail_send_message", "Compose and send an email with optional attachments. Recipients must match SEND_ALLOWLIST",
       { ...ids, ...composeShape },
@@ -229,11 +240,11 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
         guardRecipients(c);
         return gmail.users.messages.send({ userId, requestBody: await rawMessage(c) });
       }));
-    tool("gmail_send_draft", "Send an existing draft (its stored recipients are checked against SEND_ALLOWLIST first)",
+    tool("gmail_send_draft", "Send an existing draft. The stored message is validated against SEND_ALLOWLIST and sent exactly as validated — later edits to the draft do not affect what goes out",
       { ...ids, id: z.string() },
       ({ userId, id }, gmail, call) => call(async () => {
-        await guardStoredRecipients(gmail, userId, id);
-        return gmail.users.drafts.send({ userId, requestBody: { id } });
+        const raw = await validatedDraftRaw(gmail, userId, id);
+        return gmail.users.messages.send({ userId, requestBody: { raw } });
       }));
   }
   tool("gmail_modify_message", "Add/remove labels on a message (read/unread, star, archive, custom and classification labels)",

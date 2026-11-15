@@ -90,27 +90,17 @@ const startFakeGmail = async (): Promise<{ port: number; close: () => void; stat
       const body = await readBody(req);
       // drafts.create wraps the RFC 822 source in {message:{raw}}; send puts raw at top level.
       const source = (body.message as { raw?: string } | undefined)?.raw ?? body.raw;
-      const raw = Buffer.from(String(source ?? ""), "base64url").toString("utf8");
-      const to = [...raw.matchAll(/^To:\s*(.+)$/gim)].map((m) => m[1]!.trim()).join(", ");
       const id = `draft-${state.drafts.size + 1}`;
-      // Draft ids are distinct from message ids on purpose: the server must resolve
-      // recipients through users.drafts.get, not users.messages.get.
-      state.drafts.set(id, to);
+      // Draft ids are distinct from message ids on purpose, and the stored SOURCE is
+      // served back in raw format — the server must bind the send to this snapshot.
+      state.drafts.set(id, String(source ?? ""));
       return json(res, { id, message: { id: `m-for-${id}` } });
-    }
-    if (req.method === "POST" && me === "drafts/send") {
-      // Gmail API shape: the draft id travels in the request body, not the path.
-      const body = await readBody(req);
-      const to = state.drafts.get(String(body.id ?? ""));
-      if (to === undefined) return json(res, { error: { code: 404, message: "no such draft" } }, 404);
-      state.sentTo.push(...to.split(",").map((a) => a.trim()).filter(Boolean));
-      return json(res, { id: `sent-${state.sentTo.length}`, labelIds: ["SENT"] });
     }
     const draftGet = me.match(/^drafts\/([^/]+)$/);
     if (req.method === "GET" && draftGet) {
-      const to = state.drafts.get(draftGet[1]!);
-      if (to === undefined) return json(res, { error: { code: 404, message: "no such draft" } }, 404);
-      return json(res, { id: draftGet[1], message: { payload: { headers: [{ name: "To", value: to }] } } });
+      const source = state.drafts.get(draftGet[1]!);
+      if (source === undefined) return json(res, { error: { code: 404, message: "no such draft" } }, 404);
+      return json(res, { id: draftGet[1], message: { raw: source, threadId: "t-e2e" } });
     }
     if (req.method === "GET" && me === "labels") {
       return json(res, { labels: [{ id: "INBOX", name: "INBOX", type: "system" }, { id: "Label_1", name: "Receipts", type: "user" }] });
