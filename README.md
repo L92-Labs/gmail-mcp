@@ -18,9 +18,12 @@ upstream documentation; start here for what changed.
   every recipient header is validated before sending). One recipient string may not
   smuggle several mailboxes past the check — every address in it must pass — and
   custom `headers` entries may not carry recipient headers (`To`, `Cc`, `Bcc`,
-  `Resent-*`); use `to`/`cc`/`bcc` so the allowlist can see them. Recipient strings
-  without an `@` fail closed. `gmail_send_raw` bypasses the allowlist, so it only
-  exists behind `ENABLE_DANGEROUS_TOOLS`.
+  `Resent-*`), and header names must be plain tokens (letters, digits, hyphens) —
+  buildRaw colon-strips and cleans names before serializing, so `"B:cc"` would go out
+  as `Bcc`. Recipient strings are parsed structurally: every mailbox inside `<...>`
+  must pass, comment syntax `(...)` is rejected, and an `@` outside the brackets fails
+  closed. `gmail_send_raw` bypasses the allowlist, so it only exists behind
+  `ENABLE_DANGEROUS_TOOLS`.
 - Narrow OAuth scopes: `gmail-mcp auth` never requests `https://mail.google.com/`.
   Permanent delete, mailbox import/insert and raw send additionally require
   `GMAIL_MCP_SCOPES` to grant the full scope explicitly. `gmail_modify`/`compose`/
@@ -38,7 +41,7 @@ upstream documentation; start here for what changed.
 | --- | --- | --- |
 | `MAIL_MODE` | `pull` | `pull` / `draft` / `pull_push` |
 | `SEND_ALLOWLIST` | — | required (non-empty) for `pull_push`; exact addresses or domains, subdomains match |
-| `MCP_BEARER_TOKEN` | unset | unified bearer for all accounts (32+ chars); unset = per-account tokens |
+| `MCP_BEARER_TOKEN` | unset | unified bearer for all accounts (32+ chars); unset = per-account tokens. `auth --remove` also revokes unified access within the token-cache TTL (a restart re-loads any account whose OAuth grant is still stored) |
 | `DEFAULT_EMAIL_ACCOUNT` | first | account used when `account` is omitted |
 | `ENABLE_SETTINGS_TOOLS` | `false` | vacation, IMAP/POP, language, filters, forwarding, send-as |
 | `ENABLE_WORKSPACE_TOOLS` | `false` | delegates, S/MIME, CSE (dead on consumer accounts) |

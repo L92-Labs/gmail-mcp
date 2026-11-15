@@ -246,6 +246,19 @@ describe("fork gating", () => {
     expect(amy.calls).toHaveLength(0);
   });
 
+  it("send_message normalizes header names like buildRaw before checking", async () => {
+    const amy = recordingGmail();
+    const tools = collect({ clients: new Map([["amy@example.com", amy.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    // buildRaw strips colons and surrounding whitespace, so "B:cc" serializes as `Bcc`.
+    await expect(
+      invoke(tools.get("gmail_send_message")!, { to: ["friend@corp.com"], text: "hi", headers: { "B:cc": "outsider@evil.test" } })
+    ).rejects.toThrow(/must not carry recipient headers/i);
+    await expect(
+      invoke(tools.get("gmail_send_message")!, { to: ["friend@corp.com"], text: "hi", headers: { "To :": "outsider@evil.test" } })
+    ).rejects.toThrow(/must not carry recipient headers/i);
+    expect(amy.calls).toHaveLength(0);
+  });
+
   it("send_message refuses recipient headers even when arrays are absent", async () => {
     const amy = recordingGmail();
     const tools = collect({ clients: new Map([["amy@example.com", amy.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });

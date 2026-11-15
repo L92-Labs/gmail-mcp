@@ -210,6 +210,30 @@ describe("tool gating by mode", () => {
   });
 });
 
+describe("shared-token revocation on account removal", () => {
+  it("stops resolving an account whose store membership is gone", async () => {
+    const tokens = new Map([[AMY, "a-token"], [BOB, "b-token"]]);
+    const h = await boot({
+      accounts: accounts({ [AMY]: "a-token", [BOB]: "b-token" }),
+      sharedToken: SHARED,
+      tokenFor: async (email) => tokens.get(email),
+      accountLive: async (email) => tokens.has(email),
+    });
+    try {
+      const sid = await openSession(h.base, SHARED);
+      const before = await rpc(h.base, sid, SHARED, { jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "gmail_list_messages", arguments: { account: BOB } } });
+      expect(before.body.result.isError).toBeFalsy();
+      // `gmail-mcp auth --remove bob@example.com` deletes the stored bearer file:
+      tokens.delete(BOB);
+      const after = await rpc(h.base, sid, SHARED, { jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "gmail_list_messages", arguments: { account: BOB } } });
+      expect(after.body.result.isError).toBe(true);
+      expect(after.body.result.content[0].text).toMatch(/Unknown account "bob@example.com"/);
+      const amyStill = await rpc(h.base, sid, SHARED, { jsonrpc: "2.0", id: 22, method: "tools/call", params: { name: "gmail_list_messages", arguments: { account: AMY } } });
+      expect(amyStill.body.result.isError).toBeFalsy();
+    } finally { h.close(); }
+  });
+});
+
 describe("extra hosts enter the rebinding allowlist", () => {
   it("accepts configured tunnel hostnames", async () => {
     const h = await boot({ accounts: accounts({ [AMY]: "t1" }), extraHosts: ["gmail.example.com"] });

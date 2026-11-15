@@ -49,24 +49,43 @@ const list = (raw: string | undefined): string[] =>
     .map((entry) => entry.trim().toLowerCase())
     .filter(Boolean);
 
+const mailboxAllowed = (mailbox: string, allowlist: string[]): boolean => {
+  const at = mailbox.lastIndexOf("@");
+  if (at <= 0) return false;
+  const domain = mailbox.slice(at + 1);
+  return allowlist.some((entry) => mailbox === entry || domain === entry || domain.endsWith(`.${entry}`));
+};
+
+/**
+ * One comma-free chunk of a recipient string. Parsing is deliberately structural and
+ * rejects anything ambiguous instead of guessing: comment syntax `(...)` and stray `@`
+ * outside angle brackets are delivery addresses this guard will not vouch for.
+ */
+const segmentAllowed = (part: string, allowlist: string[]): boolean => {
+  if (/[()]/.test(part)) return false; // RFC comment syntax is not parsed — fail closed.
+  const pairs = [...part.matchAll(/<([^<>]*)>/g)].map((m) => m[1]!.trim().toLowerCase()).filter(Boolean);
+  if (pairs.length === 0) {
+    // Bare mailbox: exactly one @, otherwise the syntax is unsupported.
+    if ((part.match(/@/g) ?? []).length !== 1) return false;
+    return mailboxAllowed(part, allowlist);
+  }
+  // Every bracketed mailbox must pass, and no unbracketed @ may remain — a second
+  // address outside the brackets would not be the one that was validated.
+  const residue = part.replace(/<[^<>]*>/g, "");
+  if (residue.includes("@")) return false;
+  return pairs.every((mailbox) => mailboxAllowed(mailbox, allowlist));
+};
+
 /**
  * Every mailbox represented by `recipient` must pass: one string may carry several
- * addresses ("a@x.test, b@y.test") and display-name forms are fine. A segment without
- * an @ fails closed rather than guessing a domain. Allowlist entry forms: exact
- * address, or bare domain (subdomains match).
+ * addresses ("a@x.test, b@y.test" or several <addr> forms) and display names are fine
+ * as long as no @ sits outside the brackets. Allowlist entry forms: exact address, or
+ * bare domain (subdomains match).
  */
 export const recipientAllowed = (recipient: string, allowlist: string[]): boolean => {
   const parts = recipient.split(",").map((part) => part.trim().toLowerCase()).filter(Boolean);
   if (parts.length === 0) return false;
-  return parts.every((part) => {
-    // Display-name form: keep only the address inside the angle brackets.
-    const bracket = part.match(/<([^>]*)>/);
-    const mailbox = (bracket ? bracket[1] : part).trim();
-    const at = mailbox.lastIndexOf("@");
-    if (at < 0) return false;
-    const domain = mailbox.slice(at + 1);
-    return allowlist.some((entry) => mailbox === entry || domain === entry || domain.endsWith(`.${entry}`));
-  });
+  return parts.every((part) => segmentAllowed(part, allowlist));
 };
 
 export const recipientAllowedBy = (allowlist: string[]) => (recipient: string): boolean =>

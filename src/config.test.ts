@@ -137,6 +137,20 @@ describe("recipientAllowed", () => {
     expect(recipientAllowed("Bob <friend@corp.com>, Eve <evil@test.io>", allowlist)).toBe(false);
   });
 
+  it("rejects RFC comment syntax instead of guessing the real recipient", () => {
+    // The parenthesized text is a comment; the delivery address sits before it.
+    expect(recipientAllowed("outsider@evil.test (friend <friend@corp.com>)", allowlist)).toBe(false);
+    expect(recipientAllowed("(comment) friend@corp.com", allowlist)).toBe(false);
+  });
+
+  it("validates every bracketed mailbox, not just the first pair", () => {
+    expect(recipientAllowed('"Bob" <friend@corp.com>', allowlist)).toBe(true);
+    expect(recipientAllowed("a<one@corp.com> b<two@corp.com>", allowlist)).toBe(true);
+    expect(recipientAllowed('"<friend@corp.com>" <outsider@evil.test>', allowlist)).toBe(false);
+    expect(recipientAllowed("friend@corp.com> <evil@test.io", allowlist)).toBe(false);
+    expect(recipientAllowed("evil@test.io Bob <friend@corp.com>", allowlist)).toBe(false);
+  });
+
   it("fails closed on segments without an @", () => {
     expect(recipientAllowed("not-an-address", allowlist)).toBe(false);
     expect(recipientAllowed("friend@corp.com, garbage", allowlist)).toBe(false);

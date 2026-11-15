@@ -48,6 +48,11 @@ export interface HandlerOptions {
   defaultAccount?: string;
   /** Fork: extra Host header values accepted alongside loopback (tunnel/proxy frontends). */
   extraHosts?: string[];
+  /**
+   * Fork, shared-token mode: store-backed probe run before each dispatch so
+   * `gmail-mcp auth --remove` also revokes unified-token access to a mailbox.
+   */
+  accountLive?: (email: string) => Promise<boolean>;
 }
 
 const digest = (v: string): Buffer => createHash("sha256").update(v).digest();
@@ -107,6 +112,7 @@ export const createRequestHandler = ({
   features,
   defaultAccount,
   extraHosts = [],
+  accountLive,
 }: HandlerOptions) => {
   // The SDK compares the raw Host header, so list each name with and without the port.
   // Extra hosts serve tunnel/proxy frontends (e.g. a Cloudflare tunnel hostname);
@@ -187,6 +193,9 @@ export const createRequestHandler = ({
         clients,
         default: sharedToken ? (defaultAccount ?? [...clients.keys()][0]!) : email,
         ...(features ? { features } : {}),
+        // Removal must revoke shared-token access; per-account mode already consults
+        // tokenFor on every request, so the probe is only needed here.
+        ...(sharedToken && accountLive ? { liveness: accountLive } : {}),
       });
       await server.connect(transport);
       await transport.handleRequest(req, res);
@@ -275,11 +284,15 @@ const main = async (): Promise<void> => {
 
   const host = process.env.GMAIL_MCP_HOST || "127.0.0.1";
   const port = Number(process.env.GMAIL_MCP_PORT || process.env.PORT || 3016);
+  const tokenReader = cachedTokenReader();
   const { handler, sweep } = createRequestHandler({
     accounts,
     host,
     port,
-    tokenFor: cachedTokenReader(),
+    tokenFor: tokenReader,
+    accountLive: config.sharedToken
+      ? async (email) => (await tokenReader(email)) !== undefined
+      : undefined,
     sharedToken: config.sharedToken,
     features: { mode: config.mode, allowlist: config.allowlist, settingsTools: config.settingsTools, workspaceTools: config.workspaceTools, dangerousTools: config.dangerousTools },
     defaultAccount: config.defaultAccount,

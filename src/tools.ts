@@ -17,6 +17,12 @@ export interface Accounts {
   default: string;
   /** Fork guardrails. Defaults to pull mode with every optional tool family off. */
   features?: Features;
+  /**
+   * Fork, shared-token mode: store-backed membership probe. `auth --remove` deletes the
+   * stored bearer file, so a false answer stops the account resolving even though the
+   * in-memory client is still loaded.
+   */
+  liveness?: (email: string) => Promise<boolean>;
 }
 
 const json = (v: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(v ?? {}, null, 2) }] });
@@ -106,8 +112,12 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     dangerousTools: false,
   };
   const known = () => [...accounts.clients.keys()].sort();
-  const resolve = (account?: string): { email: string; gmail: Gmail } => {
+  const resolve = async (account?: string): Promise<{ email: string; gmail: Gmail }> => {
     const email = normalizeEmail(account?.trim() || accounts.default);
+    // Shared-token mode: the in-memory client outlives `gmail-mcp auth --remove`, which
+    // deletes the stored bearer file. Re-checking store membership at dispatch makes
+    // removal effective for unified sessions within the token-cache TTL.
+    if (accounts.liveness && !(await accounts.liveness(email))) throw unknownAccountError(email, known());
     const gmail = accounts.clients.get(email);
     if (!gmail) throw unknownAccountError(email, known());
     return { email, gmail };
@@ -120,12 +130,12 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
     call: Call
   ) => ReturnType<ToolCallback<S>>;
   const tool = <S extends z.ZodRawShape>(name: string, description: string, shape: S, handler: Handler<S>) =>
-    server.registerTool(name, { description, inputSchema: shape }, ((
+    server.registerTool(name, { description, inputSchema: shape }, (async (
       args: z.infer<z.ZodObject<S>>,
       _extra: RequestHandlerExtra<ServerRequest, ServerNotification>
     ) => {
       const { account, ...rest } = args as { account?: string };
-      const { email, gmail } = resolve(account);
+      const { email, gmail } = await resolve(account);
       return handler(rest as Omit<z.infer<z.ZodObject<S>>, "account">, gmail, caller(email));
       // Handler<S>'s return type (ReturnType<ToolCallback<S>>, reached through the generic `call`)
       // doesn't structurally overlap CallToolResult closely enough for a single `as ToolCallback<S>`;
@@ -178,14 +188,17 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
         );
       }
       // Recipient headers inside `headers` would bypass the array checks above; refuse
-      // them so every recipient travels through to/cc/bcc where it is validated.
-      const smuggled = Object.keys(c.headers ?? {}).filter((name) =>
-        RECIPIENT_HEADERS.includes(name.toLowerCase())
+      // them so every recipient travels through to/cc/bcc where it is validated. Names
+      // must already be plain RFC tokens: buildRaw cleans and colon-strips names before
+      // serializing, so "B:cc" goes out as `Bcc` and "To :" can parse as `To` — anything
+      // not matching [A-Za-z0-9-] is refused instead of guessed about.
+      const smuggled = Object.keys(c.headers ?? {}).filter(
+        (name) => !/^[A-Za-z0-9-]+$/.test(name) || RECIPIENT_HEADERS.includes(name.toLowerCase())
       );
       if (smuggled.length > 0) {
         throw new Error(
-          `Send refused: "headers" must not carry recipient headers (${smuggled.join(", ")}); ` +
-            "use to/cc/bcc so SEND_ALLOWLIST can check every recipient."
+          `Send refused: "headers" names must be plain tokens (letters, digits, hyphens) and must not ` +
+            `carry recipient headers (${smuggled.join(", ")}); use to/cc/bcc so SEND_ALLOWLIST sees every recipient.`
         );
       }
       if (recipients.length === 0) throw new Error("Send refused: no recipients given");
