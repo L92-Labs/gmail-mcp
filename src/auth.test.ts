@@ -270,8 +270,9 @@ describe("authorize", () => {
     const u = new URL(consentUrl);
     const redirect = new URL(u.searchParams.get("redirect_uri")!);
     const state = u.searchParams.get("state")!;
-    expect(u.searchParams.get("scope")).toContain("https://www.googleapis.com/auth/gmail.compose");
-    // Fork: the full mail scope is never requested implicitly.
+    // Fork: default env derives pull-mode scopes — no compose, never the full mail scope.
+    expect(u.searchParams.get("scope")).toContain("https://www.googleapis.com/auth/gmail.modify");
+    expect(u.searchParams.get("scope")).not.toContain("https://www.googleapis.com/auth/gmail.compose");
     expect(u.searchParams.get("scope")).not.toContain("https://mail.google.com/");
     expect(u.searchParams.get("prompt")).toBe("consent select_account");
 

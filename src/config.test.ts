@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseConfig, recipientAllowed } from "./config.js";
+import { consentScopes, parseConfig, recipientAllowed } from "./config.js";
 
 const base = {
   MAIL_MODE: "pull",
@@ -90,6 +90,21 @@ describe("parseConfig", () => {
     });
     expect(explicit.scopes).toContain("https://mail.google.com/");
     expect(explicit.dangerousTools).toBe(true);
+  });
+
+  it("consentScopes mirrors the derived policy and falls back standalone", () => {
+    const pull = consentScopes({ MAIL_MODE: "pull" });
+    expect(pull).not.toContain("https://www.googleapis.com/auth/gmail.compose");
+    const push = consentScopes({ MAIL_MODE: "pull_push", SEND_ALLOWLIST: "corp.com" });
+    expect(push).toContain("https://www.googleapis.com/auth/gmail.compose");
+    expect(push).not.toContain("https://mail.google.com/");
+    // Standalone auth (invalid/incomplete env): conservative fork fallback, no full scope.
+    const standalone = consentScopes({ MAIL_MODE: "pull_push", SEND_ALLOWLIST: "" });
+    expect(standalone).toContain("https://www.googleapis.com/auth/gmail.compose");
+    expect(standalone).not.toContain("https://mail.google.com/");
+    expect(consentScopes({ GMAIL_MCP_SCOPES: "https://www.googleapis.com/auth/gmail.readonly" })).toEqual([
+      "https://www.googleapis.com/auth/gmail.readonly",
+    ]);
   });
 
   it("honors a GMAIL_MCP_SCOPES override", () => {

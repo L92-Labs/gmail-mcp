@@ -254,6 +254,10 @@ export const cli = async (argv: string[]): Promise<boolean> => {
   }
   if (flag) throw new Error(`Unknown option ${flag}. Usage: gmail-mcp auth [--remove <email>]`);
   await authorize();
+  // The Google clients hold keep-alive handles that would otherwise keep this process
+  // alive for minutes after the work is done. The timer only fires while that is the
+  // case; a naturally emptying event loop still exits on its own.
+  setTimeout(() => process.exit(0), 250).unref();
   return true;
 };
 

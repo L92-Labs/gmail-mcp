@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { google, type Auth, type gmail_v1 } from "googleapis";
+import { consentScopes } from "./config.js";
 import { assertValidAccount, CLIENT_KEY, fileStore, resolveStore, type SecretStore } from "./secret-store.js";
 
 const configDir = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
@@ -178,32 +179,6 @@ export const removeAccount = async (email: string): Promise<void> => {
   const store = await readyStore();
   store.delete(oauthKey(target));
   store.delete(bearerKey(target));
-};
-
-// Fork scope policy: never request the full `mail.google.com` scope implicitly. These
-// cover read/organize (modify), labels, drafts and sending (compose), and settings.
-// Permanent delete, mailbox import/insert and raw send need the full scope, which this
-// fork only grants through an explicit GMAIL_MCP_SCOPES override — see ENABLE_DANGEROUS_TOOLS.
-const FORK_SCOPES = [
-  "https://www.googleapis.com/auth/gmail.modify",
-  "https://www.googleapis.com/auth/gmail.labels",
-  "https://www.googleapis.com/auth/gmail.compose",
-  "https://www.googleapis.com/auth/gmail.settings.basic",
-  "https://www.googleapis.com/auth/gmail.settings.sharing",
-];
-
-/**
- * `gmail-mcp auth` requests GMAIL_MCP_SCOPES when set (comma or space separated URLs),
- * otherwise FORK_SCOPES. Narrower stored tokens are fine: tools the token lacks scope
- * for fail at Google with an actionable message, and the server's own tool gating keeps
- * them off the tool list in the first place.
- */
-export const resolveScopes = (override: string | undefined = process.env.GMAIL_MCP_SCOPES): string[] => {
-  const parsed = (override ?? "")
-    .split(/[,\s]+/)
-    .map((entry) => entry.trim())
-    .filter((entry) => /^https:\/\//.test(entry));
-  return parsed.length > 0 ? parsed : FORK_SCOPES;
 };
 
 const AUTH_TIMEOUT_MS = 5 * 60_000;
@@ -437,7 +412,7 @@ export const authorize = async ({
   const redirectUri = `http://127.0.0.1:${port}/oauth2callback`;
   const client = await createClient(redirectUri);
   const state = randomUUID();
-  const url = client.generateAuthUrl({ access_type: "offline", prompt: "consent select_account", scope: resolveScopes(), state });
+  const url = client.generateAuthUrl({ access_type: "offline", prompt: "consent select_account", scope: consentScopes(), state });
 
   try {
     const code = await new Promise<string>((resolve, reject) => {

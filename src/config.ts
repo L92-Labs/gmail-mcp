@@ -137,6 +137,32 @@ const deriveScopes = (f: Features): string[] => {
   return scopes;
 };
 
+/** Standalone `gmail-mcp auth` (no server config in env) falls back to the widest set
+ * the fork can legitimately use — never the full mail scope. The server's tool gating
+ * still restricts what any narrower token can do at runtime. */
+const FALLBACK_CONSENT_SCOPES = [
+  "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/gmail.labels",
+  "https://www.googleapis.com/auth/gmail.compose",
+  "https://www.googleapis.com/auth/gmail.settings.basic",
+  "https://www.googleapis.com/auth/gmail.settings.sharing",
+];
+
+/**
+ * Scopes the next OAuth consent should request: the GMAIL_MCP_SCOPES override, else
+ * the policy derived from the current env (so a pull deployment never consents to
+ * compose or settings), else the fork fallback for standalone auth runs.
+ */
+export const consentScopes = (env: Record<string, string | undefined> = process.env): string[] => {
+  const override = list(env.GMAIL_MCP_SCOPES);
+  if (override.length > 0) return override;
+  try {
+    return parseConfig(env).scopes;
+  } catch {
+    return FALLBACK_CONSENT_SCOPES.slice();
+  }
+};
+
 const describeMode = (mode: MailMode): string =>
   mode === "pull"
     ? "read and organize only"
