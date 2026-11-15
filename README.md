@@ -31,8 +31,10 @@ upstream documentation; start here for what changed.
   `Resent-*`), and header names must be plain tokens (letters, digits, hyphens) —
   buildRaw colon-strips and cleans names before serializing, so `"B:cc"` would go out
   as `Bcc`. Recipient strings are parsed structurally: every mailbox inside `<...>`
-  must pass, comment syntax `(...)` is rejected, and an `@` outside the brackets fails
-  closed. `gmail_send_raw` bypasses the allowlist, so it only exists behind
+  must pass, comment syntax `(...)` is rejected, an `@` outside the brackets fails
+  closed, and Unicode line separators (U+2028/U+2029) in a draft's header block are
+  refused — JavaScript regexes treat them as line boundaries while RFC parsers do not,
+  which would let a display name hide an unvalidated address. `gmail_send_raw` bypasses the allowlist, so it only exists behind
   `ENABLE_DANGEROUS_TOOLS`.
 - Narrow OAuth scopes: `gmail-mcp auth` never requests `https://mail.google.com/`.
   Permanent delete, mailbox import/insert and raw send additionally require

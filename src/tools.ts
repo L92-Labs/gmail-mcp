@@ -238,6 +238,15 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
       const decoded = Buffer.from(raw, "base64url").toString("utf8");
       // Only the header block decides recipients; a "To:" line in the body must not count.
       const headerBlock = decoded.split(/\r?\n\r?\n/, 1)[0] ?? "";
+      // JavaScript regexes treat U+2028/U+2029 as line boundaries while RFC parsers do
+      // not, so a value like 'To: "<a@b>\u2028" <evil@x>' would validate the bracketed
+      // address and deliver to the unvalidated one. Such characters are never
+      // legitimate in a header block — reject instead of trying to parse them.
+      if (/[\u2028\u2029]/.test(headerBlock)) {
+        throw new Error(
+          "Send refused: the draft's header block contains Unicode line-separator characters (U+2028/U+2029), which the recipient check cannot parse safely."
+        );
+      }
       const unfolded = headerBlock.replace(/\r?\n[ \t]+/g, " "); // unfold folded headers
       if (/^Resent-(?:To|Cc|Bcc):/im.test(unfolded)) {
         throw new Error(

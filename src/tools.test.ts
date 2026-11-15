@@ -280,6 +280,17 @@ describe("fork gating", () => {
     expect(sent).toBe(true);
   });
 
+  it("send_draft refuses Unicode line separators inside the draft header block", async () => {
+    // U+2028 inside the display name: JS regexes stop the validated capture there,
+    // while the real delivery address is outsider@evil.test (Codex round 9).
+    let sent = false;
+    const fake = draftFake('To: "<friend@corp.com>\u2028" <outsider@evil.test>\r\n\r\nbody', () => { sent = true; });
+    const tools = collect({ clients: new Map([["amy@example.com", fake.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    await expect(invoke(tools.get("gmail_send_draft")!, { id: "d" })).rejects.toThrow(/U\+2028/);
+    expect(sent).toBe(false);
+    expect(fake.wasDeleted()).toBe(false);
+  });
+
   it("send_draft refuses stored recipients outside the allowlist, before sending", async () => {
     let sent = false;
     const fake = draftFake("To: friend@corp.com, victim@gmail.com\r\n\r\nbody", () => { sent = true; });
