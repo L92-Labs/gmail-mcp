@@ -302,11 +302,10 @@ describe("fork gating", () => {
     const [r1, r2] = await Promise.allSettled([first, second]);
 
     expect(sends).toBe(1); // the lock held the second call until the draft was consumed
-    const fulfilled = r1.status === "fulfilled" ? r1 : r2;
-    const rejected = r1.status === "rejected" ? r1 : r2;
-    expect(fulfilled.status).toBe("fulfilled");
-    expect(rejected.status).toBe("rejected");
-    expect((rejected.reason as Error).message).toMatch(/could not find that resource/);
+    const rejectedReason =
+      r1.status === "rejected" ? r1.reason : r2.status === "rejected" ? r2.reason : undefined;
+    expect(rejectedReason, "expected exactly one rejected call").toBeDefined();
+    expect((rejectedReason as Error).message).toMatch(/could not find that resource/);
   });
 
   it("send_draft ignores a To: line inside the body and refuses Resent-* headers", async () => {
