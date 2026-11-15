@@ -17,8 +17,10 @@ upstream documentation; start here for what changed.
   `gmail_send_draft`, which fetches the draft's full RFC 822 source via
   `users.drafts.get`, validates every recipient header (quoted display names and
   folded headers included, header block only), and then sends **exactly that validated
-  snapshot** through `messages.send` — a concurrent draft edit cannot change what goes
-  out. One recipient string may not
+  snapshot** (with the draft's `threadId`, so replies stay in their conversation)
+  through `messages.send` — a concurrent draft edit cannot change what goes out. After
+  a successful send the draft is consumed (mirroring Gmail's `drafts.send` lifecycle),
+  unless it was edited meanwhile — the edited version stays in Drafts. One recipient string may not
   smuggle several mailboxes past the check — every address in it must pass — and
   custom `headers` entries may not carry recipient headers (`To`, `Cc`, `Bcc`,
   `Resent-*`), and header names must be plain tokens (letters, digits, hyphens) —

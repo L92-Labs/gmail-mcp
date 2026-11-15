@@ -190,29 +190,44 @@ describe("registerTools", () => {
 
 // ---- Fork: mode gating and the send allowlist ----
 
-// A fake whose drafts.get returns the raw RFC 822 source, so the send_draft guard
-// validates and forwards the exact snapshot. The guard must fetch via users.drafts.get
-// (draft ids are not message ids) and hand the SAME raw to users.messages.send — the
-// fake exposes no drafts.send and no messages.get, so any other path fails.
-const draftWithRaw = (rfc822: string, onSend: (raw: string) => void) => {
+// A stateful draft fake: the first drafts.get sees the initial source, later gets see
+// whatever the test mutated it to (concurrent-edit simulation), delete consumes it.
+// The guard must fetch via users.drafts.get (draft ids are not message ids) and hand
+// the validated snapshot to users.messages.send — no drafts.send, no messages.get.
+const draftFake = (rfc822: string, onSend: (raw: string, threadId?: string) => void) => {
+  let stored = rfc822;
+  let deleted = false;
+  let gets = 0;
   const gmail = {
     users: {
       drafts: {
-        get: async () => ({
-          data: { id: "d", message: { raw: Buffer.from(rfc822, "utf8").toString("base64url"), threadId: "t1" } },
-        }),
+        get: async () => {
+          gets += 1;
+          if (deleted) throw Object.assign(new Error("no such draft"), { response: { status: 404 } });
+          const raw = gets === 1 ? rfc822 : stored;
+          return { data: { id: "d", message: { raw: Buffer.from(raw, "utf8").toString("base64url"), threadId: "t1" } } };
+        },
+        delete: async () => {
+          deleted = true;
+          return { data: {} };
+        },
       },
       messages: {
-        send: async (args: { requestBody: { raw?: string } }) => {
+        send: async (args: { requestBody: { raw?: string; threadId?: string } }) => {
           const raw = Buffer.from(args.requestBody.raw ?? "", "base64url").toString("utf8");
-          onSend(raw);
+          onSend(raw, args.requestBody.threadId);
           return { data: { id: "sent-1", labelIds: ["SENT"] } };
         },
       },
       settings: {},
     },
   };
-  return gmail as unknown as gmail_v1.Gmail;
+  return {
+    gmail: gmail as unknown as gmail_v1.Gmail,
+    /** Simulates a concurrent update_draft between validation and send. */
+    mutate: (next: string) => { stored = next; },
+    wasDeleted: () => deleted,
+  };
 };
 
 describe("fork gating", () => {
@@ -226,42 +241,63 @@ describe("fork gating", () => {
 
   it("send_draft validates the stored snapshot and sends those exact bytes", async () => {
     let sentRaw = "";
+    let sentThreadId: string | undefined;
     const source = "To: friend@corp.com\r\nSubject: hi\r\n\r\nbody";
-    const draft = draftWithRaw(source, (raw) => { sentRaw = raw; });
-    const tools = collect({ clients: new Map([["amy@example.com", draft]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    const fake = draftFake(source, (raw, threadId) => { sentRaw = raw; sentThreadId = threadId; });
+    const tools = collect({ clients: new Map([["amy@example.com", fake.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
     await invoke(tools.get("gmail_send_draft")!, { id: "d" });
     // Bound to the validated snapshot: the outgoing raw is byte-identical to what was
-    // checked, so a concurrent update_draft cannot change what goes out.
+    // checked, and the stored thread rides along so replies stay in their conversation.
     expect(sentRaw).toBe(source);
+    expect(sentThreadId).toBe("t1");
+  });
+
+  it("send_draft consumes the draft after a successful send", async () => {
+    const fake = draftFake("To: friend@corp.com\r\n\r\nbody", () => {});
+    const tools = collect({ clients: new Map([["amy@example.com", fake.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    await invoke(tools.get("gmail_send_draft")!, { id: "d" });
+    expect(fake.wasDeleted()).toBe(true); // Gmail's drafts.send lifecycle: sent = consumed
+  });
+
+  it("send_draft keeps a concurrently edited draft instead of deleting the new content", async () => {
+    let sentRaw = "";
+    const fake = draftFake("To: friend@corp.com\r\n\r\nbody", (raw) => { sentRaw = raw; });
+    fake.mutate("To: outsider@evil.test\r\n\r\nedited while sending");
+    const tools = collect({ clients: new Map([["amy@example.com", fake.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    await invoke(tools.get("gmail_send_draft")!, { id: "d" });
+    // The validated snapshot went out; the edited draft is preserved for the user.
+    expect(sentRaw).toBe("To: friend@corp.com\r\n\r\nbody");
+    expect(fake.wasDeleted()).toBe(false);
   });
 
   it("send_draft understands quoted display names and folded recipient headers", async () => {
     let sent = false;
     const source = 'To: "Doe, Jane" <jane@corp.com>\r\nCc: one@corp.com,\r\n two@corp.com\r\n\r\nbody';
-    const draft = draftWithRaw(source, () => { sent = true; });
-    const tools = collect({ clients: new Map([["amy@example.com", draft]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    const fake = draftFake(source, () => { sent = true; });
+    const tools = collect({ clients: new Map([["amy@example.com", fake.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
     await invoke(tools.get("gmail_send_draft")!, { id: "d" });
     expect(sent).toBe(true);
   });
 
   it("send_draft refuses stored recipients outside the allowlist, before sending", async () => {
     let sent = false;
-    const draft = draftWithRaw("To: friend@corp.com, victim@gmail.com\r\n\r\nbody", () => { sent = true; });
-    const tools = collect({ clients: new Map([["amy@example.com", draft]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    const fake = draftFake("To: friend@corp.com, victim@gmail.com\r\n\r\nbody", () => { sent = true; });
+    const tools = collect({ clients: new Map([["amy@example.com", fake.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
     await expect(invoke(tools.get("gmail_send_draft")!, { id: "d" })).rejects.toThrow(/SEND_ALLOWLIST.*victim@gmail\.com/);
     expect(sent).toBe(false);
+    expect(fake.wasDeleted()).toBe(false);
   });
 
   it("send_draft ignores a To: line inside the body and refuses Resent-* headers", async () => {
     const trick = "To: friend@corp.com\r\n\r\nignore this line please\r\nTo: victim@gmail.com\r\n";
     let sent = false;
-    const draft = draftWithRaw(trick, () => { sent = true; });
-    const tools = collect({ clients: new Map([["amy@example.com", draft]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    const fake = draftFake(trick, () => { sent = true; });
+    const tools = collect({ clients: new Map([["amy@example.com", fake.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
     await invoke(tools.get("gmail_send_draft")!, { id: "d" });
     expect(sent).toBe(true); // the body line is not a recipient header
 
-    const resent = draftWithRaw("Resent-To: outsider@evil.test\r\nTo: friend@corp.com\r\n\r\nbody", () => { sent = true; });
-    const tools2 = collect({ clients: new Map([["amy@example.com", resent]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
+    const resent = draftFake("Resent-To: outsider@evil.test\r\nTo: friend@corp.com\r\n\r\nbody", () => { sent = true; });
+    const tools2 = collect({ clients: new Map([["amy@example.com", resent.gmail]]), default: "amy@example.com", features: pullPush(["corp.com"]) });
     await expect(invoke(tools2.get("gmail_send_draft")!, { id: "d" })).rejects.toThrow(/Resent-/);
     expect(sent).toBe(true); // unchanged by the refused call
   });

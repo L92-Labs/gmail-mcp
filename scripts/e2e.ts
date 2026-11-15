@@ -97,6 +97,10 @@ const startFakeGmail = async (): Promise<{ port: number; close: () => void; stat
       return json(res, { id, message: { id: `m-for-${id}` } });
     }
     const draftGet = me.match(/^drafts\/([^/]+)$/);
+    if (req.method === "DELETE" && draftGet) {
+      state.drafts.delete(draftGet[1]!); // the server consumes sent drafts
+      return json(res, {});
+    }
     if (req.method === "GET" && draftGet) {
       const source = state.drafts.get(draftGet[1]!);
       if (source === undefined) return json(res, { error: { code: 404, message: "no such draft" } }, 404);

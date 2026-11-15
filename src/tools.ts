@@ -208,7 +208,11 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
      * exact snapshot that is sent afterwards — never the mutable draft id — so a
      * concurrent update_draft cannot swap recipients between validation and send.
      */
-    const validatedDraftRaw = async (gmail: Gmail, userId: string, draftId: string): Promise<string> => {
+    const validatedDraftRaw = async (
+      gmail: Gmail,
+      userId: string,
+      draftId: string
+    ): Promise<{ raw: string; threadId?: string }> => {
       const { data } = await gmail.users.drafts.get({ userId, id: draftId, format: "raw" });
       const raw = data.message?.raw ?? "";
       const decoded = Buffer.from(raw, "base64url").toString("utf8");
@@ -232,7 +236,8 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
             `Allowed: ${features.allowlist.join(", ")}.`
         );
       }
-      return raw;
+      // threadId travels along so a stored reply stays in its conversation.
+      return { raw, threadId: data.message?.threadId ?? undefined };
     };
     tool("gmail_send_message", "Compose and send an email with optional attachments. Recipients must match SEND_ALLOWLIST",
       { ...ids, ...composeShape },
@@ -240,11 +245,28 @@ export const registerTools = (server: McpServer, accounts: Accounts): void => {
         guardRecipients(c);
         return gmail.users.messages.send({ userId, requestBody: await rawMessage(c) });
       }));
-    tool("gmail_send_draft", "Send an existing draft. The stored message is validated against SEND_ALLOWLIST and sent exactly as validated — later edits to the draft do not affect what goes out",
+    tool("gmail_send_draft", "Send an existing draft. The stored message is validated against SEND_ALLOWLIST and sent exactly as validated (later edits do not affect what goes out); the draft is consumed afterwards unless it was edited meanwhile",
       { ...ids, id: z.string() },
       ({ userId, id }, gmail, call) => call(async () => {
-        const raw = await validatedDraftRaw(gmail, userId, id);
-        return gmail.users.messages.send({ userId, requestBody: { raw } });
+        const snapshot = await validatedDraftRaw(gmail, userId, id);
+        const { data } = await gmail.users.messages.send({
+          userId,
+          requestBody: { raw: snapshot.raw, threadId: snapshot.threadId },
+        });
+        // Mirror Gmail's drafts.send lifecycle: a sent draft is consumed. Delete only
+        // when it still holds exactly the snapshot that went out — concurrent edits
+        // survive, and a failed cleanup never fails the already-successful send.
+        try {
+          const current = await gmail.users.drafts.get({ userId, id, format: "raw" });
+          if (current.data.message?.raw === snapshot.raw) {
+            await gmail.users.drafts.delete({ userId, id });
+          } else {
+            console.error(`gmail-mcp: draft ${id} was edited while sending; keeping the edited version in Drafts.`);
+          }
+        } catch (err) {
+          console.error(`gmail-mcp: sent draft ${id} but could not consume it:`, err);
+        }
+        return { data };
       }));
   }
   tool("gmail_modify_message", "Add/remove labels on a message (read/unread, star, archive, custom and classification labels)",
