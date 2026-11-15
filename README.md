@@ -61,6 +61,7 @@ upstream documentation; start here for what changed.
 | `MCP_ALLOWED_HOSTS` | loopback | extra allowed `Host` values (tunnels, proxies); `host:port` entries match exactly |
 | `GMAIL_MCP_SCOPES` | derived | explicit scope override (comma/space separated URLs) |
 | `GMAIL_MCP_API_ROOT` | googleapis | Gmail REST root override (test doubles) |
+| `GMAIL_MCP_CALLBACK_PORT` | OS-assigned | fixed loopback OAuth callback port — set it on headless hosts so an `ssh -L port:127.0.0.1:port` forward from your browser machine stays valid across accounts |
 
 Tests: `pnpm test` (unit + HTTP integration), `pnpm e2e` (builds `dist/`, boots the real
 server against a fake Gmail REST API, drives it with a real MCP client across all four

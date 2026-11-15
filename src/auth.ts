@@ -305,6 +305,8 @@ export const createClient = async (
 export interface AuthorizeOptions {
   /** Hand the consent URL to the user. Defaults to xdg-open plus a stderr print. */
   open?: (url: string) => void;
+  /** Fixed loopback callback port. Defaults to GMAIL_MCP_CALLBACK_PORT, else OS-assigned. */
+  callbackPort?: number;
   /** Exchange the callback code for tokens. Defaults to the OAuth client's getToken. */
   exchange?: (client: Auth.OAuth2Client, code: string) => Promise<Auth.Credentials>;
   /** Look up the signed-in address after consent. Defaults to Gmail's getProfile. */
@@ -409,9 +411,28 @@ export const authorize = async ({
   profile = fetchProfileEmail,
   timeoutMs = AUTH_TIMEOUT_MS,
   profileTimeoutMs = PROFILE_TIMEOUT_MS,
+  callbackPort = Number.parseInt(process.env.GMAIL_MCP_CALLBACK_PORT ?? "", 10) || 0,
 }: AuthorizeOptions = {}): Promise<{ email: string; token: string }> => {
   const server = createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  // GMAIL_MCP_CALLBACK_PORT (or the callbackPort option) pins the loopback callback
+  // port: headless hosts behind an SSH port-forward (ssh -L <port>:127.0.0.1:<port>
+  // host) get a stable redirect URI across accounts. Unset, the OS picks a free port
+  // as before. Google accepts any loopback port for installed-app clients, so no
+  // console change is needed.
+  const listenPort = callbackPort > 0 && callbackPort <= 65535 ? callbackPort : 0;
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(listenPort, "127.0.0.1", () => {
+      server.removeAllListeners("error");
+      server.on("error", (err) => console.error("gmail-mcp: callback server error:", err));
+      resolve();
+    });
+  }).catch((err: NodeJS.ErrnoException) => {
+    throw new Error(
+      `Could not bind the OAuth callback on 127.0.0.1:${listenPort} (${err.message}). ` +
+        "Free the port or unset GMAIL_MCP_CALLBACK_PORT to pick one automatically."
+    );
+  });
   const { port } = server.address() as { port: number };
   const redirectUri = `http://127.0.0.1:${port}/oauth2callback`;
   const client = await createClient(redirectUri);

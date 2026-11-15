@@ -229,6 +229,31 @@ describe("account store", () => {
 });
 
 describe("authorize", () => {
+  it("pins the OAuth callback to GMAIL_MCP_CALLBACK_PORT for port-forward setups", async () => {
+    const dir = await tmp();
+    await writeCredentials(dir);
+    const a = await freshAuth(dir);
+    let consentUrl = "";
+    const done = a.authorize({
+      callbackPort: 45454,
+      open: (url) => void (consentUrl = url),
+      exchange: async (_client, code) => ({ refresh_token: `rt-${code}` }),
+      profile: async () => "Pinned@Example.com",
+    });
+    await vi.waitFor(() => expect(consentUrl).not.toBe(""));
+    const u = new URL(consentUrl);
+    expect(u.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:45454/oauth2callback");
+    // Drive the real callback server on the pinned port: wrong state is refused, the
+    // good code completes the flow.
+    expect((await fetch(new URL("/favicon.ico", u.searchParams.get("redirect_uri")!))).status).toBe(404);
+    const ok = await fetch(new URL(`/oauth2callback?code=good&state=${u.searchParams.get("state")}`, u.searchParams.get("redirect_uri")!));
+    expect(ok.status).toBe(200);
+    const result = await done;
+    expect(result.email).toBe("pinned@example.com");
+    expect(await a.listAccounts()).toContain("pinned@example.com");
+    await a.removeAccount("pinned@example.com");
+  });
+
   it("ignores stray paths and wrong state, then exchanges the matching code and saves tokens", async () => {
     const dir = await tmp();
     await writeCredentials(dir);
