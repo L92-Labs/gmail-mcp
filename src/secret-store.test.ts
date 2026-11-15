@@ -203,10 +203,12 @@ describe("resolveStore", () => {
 
 // Deliberately isolated: a per-process service name so a developer's real gmail-mcp
 // entries are never touched, and skipIf so a host without a store reports "skipped".
+// The probe must pass the same linux options keyringStore uses, or @napi-rs/keyring
+// silently probes the RAM-only kernel keyring and a headless host reports available.
 const keyringAvailable = await (async (): Promise<boolean> => {
   try {
     const native = (await import("@napi-rs/keyring")) as unknown as NativeKeyring;
-    new native.Entry("gmail-mcp-selftest", "probe").getPassword();
+    new native.Entry("gmail-mcp-selftest", "probe", { linux: { store: "secret-service" } }).getPassword();
     return true;
   } catch {
     return false;

@@ -5,10 +5,22 @@ import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { google, type Auth, type gmail_v1 } from "googleapis";
+import { consentScopes } from "./config.js";
 import { assertValidAccount, CLIENT_KEY, fileStore, resolveStore, type SecretStore } from "./secret-store.js";
 
 const configDir = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
 const dataDir = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+
+/**
+ * Gmail REST root. Override (GMAIL_MCP_API_ROOT) points at a test double so the e2e
+ * suite exercises the real server and MCP protocol without touching a real mailbox.
+ */
+const rawApiRoot = process.env.GMAIL_MCP_API_ROOT?.trim();
+export const API_ROOT =
+  rawApiRoot && /^https?:\/\//.test(rawApiRoot) ? (rawApiRoot.endsWith("/") ? rawApiRoot : `${rawApiRoot}/`) : undefined;
+
+const gmailEndpoint = (auth: Auth.OAuth2Client): gmail_v1.Gmail =>
+  google.gmail({ version: "v1", auth, ...(API_ROOT ? { rootUrl: API_ROOT } : {}) });
 
 // Reuses google-mcp's OAuth client; override to point anywhere else.
 export const CREDENTIALS_PATH =
@@ -169,13 +181,6 @@ export const removeAccount = async (email: string): Promise<void> => {
   store.delete(bearerKey(target));
 };
 
-// Full mailbox (needed for messages.delete / batchDelete / insert / import) plus settings.
-export const SCOPES = [
-  "https://mail.google.com/",
-  "https://www.googleapis.com/auth/gmail.settings.basic",
-  "https://www.googleapis.com/auth/gmail.settings.sharing",
-];
-
 const AUTH_TIMEOUT_MS = 5 * 60_000;
 /** Budget for post-consent network calls (profile lookup, token exchange) before giving up. */
 export const PROFILE_TIMEOUT_MS = 30_000;
@@ -275,6 +280,8 @@ export const createClient = async (
 export interface AuthorizeOptions {
   /** Hand the consent URL to the user. Defaults to xdg-open plus a stderr print. */
   open?: (url: string) => void;
+  /** Fixed loopback callback port. Defaults to GMAIL_MCP_CALLBACK_PORT, else OS-assigned. */
+  callbackPort?: number;
   /** Exchange the callback code for tokens. Defaults to the OAuth client's getToken. */
   exchange?: (client: Auth.OAuth2Client, code: string) => Promise<Auth.Credentials>;
   /** Look up the signed-in address after consent. Defaults to Gmail's getProfile. */
@@ -285,7 +292,7 @@ export interface AuthorizeOptions {
 }
 
 const fetchProfileEmail = async (client: Auth.OAuth2Client): Promise<string> => {
-  const { data } = await google.gmail({ version: "v1", auth: client }).users.getProfile({ userId: "me" });
+  const { data } = await gmailEndpoint(client).users.getProfile({ userId: "me" });
   if (!data.emailAddress) throw new Error("Gmail getProfile returned no emailAddress");
   return data.emailAddress;
 };
@@ -332,7 +339,7 @@ const migrateLegacy = async (
 export const loadAccounts = async ({
   profile = fetchProfileEmail,
   legacyPaths = [TOKEN_PATH, SEED_TOKEN_PATH],
-  gmailFor = (auth) => google.gmail({ version: "v1", auth }),
+  gmailFor = (auth) => gmailEndpoint(auth),
   profileTimeoutMs = PROFILE_TIMEOUT_MS,
 }: LoadAccountsOptions = {}): Promise<LoadedAccounts | undefined> => {
   let emails = await listAccounts();
@@ -379,14 +386,33 @@ export const authorize = async ({
   profile = fetchProfileEmail,
   timeoutMs = AUTH_TIMEOUT_MS,
   profileTimeoutMs = PROFILE_TIMEOUT_MS,
+  callbackPort = Number.parseInt(process.env.GMAIL_MCP_CALLBACK_PORT ?? "", 10) || 0,
 }: AuthorizeOptions = {}): Promise<{ email: string; token: string }> => {
   const server = createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  // GMAIL_MCP_CALLBACK_PORT (or the callbackPort option) pins the loopback callback
+  // port: headless hosts behind an SSH port-forward (ssh -L <port>:127.0.0.1:<port>
+  // host) get a stable redirect URI across accounts. Unset, the OS picks a free port
+  // as before. Google accepts any loopback port for installed-app clients, so no
+  // console change is needed.
+  const listenPort = callbackPort > 0 && callbackPort <= 65535 ? callbackPort : 0;
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(listenPort, "127.0.0.1", () => {
+      server.removeAllListeners("error");
+      server.on("error", (err) => console.error("gmail-mcp: callback server error:", err));
+      resolve();
+    });
+  }).catch((err: NodeJS.ErrnoException) => {
+    throw new Error(
+      `Could not bind the OAuth callback on 127.0.0.1:${listenPort} (${err.message}). ` +
+        "Free the port or unset GMAIL_MCP_CALLBACK_PORT to pick one automatically."
+    );
+  });
   const { port } = server.address() as { port: number };
   const redirectUri = `http://127.0.0.1:${port}/oauth2callback`;
   const client = await createClient(redirectUri);
   const state = randomUUID();
-  const url = client.generateAuthUrl({ access_type: "offline", prompt: "consent select_account", scope: SCOPES, state });
+  const url = client.generateAuthUrl({ access_type: "offline", prompt: "consent select_account", scope: consentScopes(), state });
 
   try {
     const code = await new Promise<string>((resolve, reject) => {

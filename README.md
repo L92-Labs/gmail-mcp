@@ -1,4 +1,72 @@
-# gmail-mcp
+# gmail-mcp (L92-Labs fork)
+
+A hardening fork of [quinnjr/gmail-mcp](https://github.com/quinnjr/gmail-mcp) (MIT) for
+multi-account, MCP-portal-fronted deployments. Everything below the fork banner is
+upstream documentation; start here for what changed.
+
+**Enforcement defaults** (all parsed at boot; a bad deployment dies before binding):
+
+- `MAIL_MODE` = `pull` | `draft` | `pull_push` — pull reads and organizes only, draft
+  adds composing, pull_push adds sending. **pull_push without a non-empty
+  `SEND_ALLOWLIST` refuses to boot** (prompt-injection guard; unlike mail-mcp, empty is
+  not "anyone").
+- `MCP_BEARER_TOKEN` (optional) — unified portal-style bearer: one token for every
+  signed-in account, tools take `account` to pick a mailbox (needs 32+ chars). Unset =
+  upstream per-account bearer behavior, unchanged.
+- `SEND_ALLOWLIST` — recipient guard enforced inside every send tool, including
+  `gmail_send_draft`, which fetches the draft's full RFC 822 source via
+  `users.drafts.get`, validates every recipient header (quoted display names and
+  folded headers included, header block only), and then sends **exactly that validated
+  snapshot** (with the draft's `threadId`, so replies stay in their conversation)
+  through `messages.send` — a concurrent draft edit cannot change what goes out. After
+  a successful send the draft is consumed (mirroring Gmail's `drafts.send` lifecycle),
+  unless it was edited meanwhile — the edited version stays in Drafts. Overlapping
+  sends of the same draft are serialized per mailbox+draft, so one draft cannot go out
+  twice from parallel calls. Known
+  limitation: the Gmail API has no conditional delete, so an edit saved in the few
+  milliseconds between the consumption check and the deletion would be consumed with
+  the draft; the sent message itself is always the validated snapshot. One recipient string may not
+  smuggle several mailboxes past the check — every address in it must pass — and
+  custom `headers` entries may not carry recipient headers (`To`, `Cc`, `Bcc`,
+  `Resent-*`), and header names must be plain tokens (letters, digits, hyphens) —
+  buildRaw colon-strips and cleans names before serializing, so `"B:cc"` would go out
+  as `Bcc`. Recipient strings are parsed structurally: every mailbox inside `<...>`
+  must pass, comment syntax `(...)` is rejected, an `@` outside the brackets fails
+  closed, and Unicode line separators (U+2028/U+2029) in a draft's header block are
+  refused — JavaScript regexes treat them as line boundaries while RFC parsers do not,
+  which would let a display name hide an unvalidated address. `gmail_send_raw` bypasses the allowlist, so it only exists behind
+  `ENABLE_DANGEROUS_TOOLS`.
+- Narrow OAuth scopes: `gmail-mcp auth` never requests `https://mail.google.com/`.
+  Permanent delete, mailbox import/insert and raw send additionally require
+  `GMAIL_MCP_SCOPES` to grant the full scope explicitly. `gmail_modify`/`compose`/
+  `labels`/`settings` cover everything else the fork exposes.
+- Workspace-only tools (delegates, S/MIME, CSE) and mailbox settings writes (vacation,
+  filters, forwarding, auto-forwarding, IMAP/POP, send-as) are off by default
+  (`ENABLE_WORKSPACE_TOOLS`, `ENABLE_SETTINGS_TOOLS`).
+- `MCP_ALLOWED_HOSTS` — extra Host header values accepted alongside loopback, for
+  reverse proxies and Cloudflare tunnels (DNS-rebinding protection stays on).
+- `GMAIL_MCP_API_ROOT` — point the Gmail REST client at a different endpoint; the e2e
+  suite runs the real server against a local fake, so no real Google account is needed.
+- `GMAIL_MCP_KEYRING=file` is the container default (servers have no desktop keyring).
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `MAIL_MODE` | `pull` | `pull` / `draft` / `pull_push` |
+| `SEND_ALLOWLIST` | — | required (non-empty) for `pull_push`; exact addresses or domains, subdomains match |
+| `MCP_BEARER_TOKEN` | unset | unified bearer for all accounts (32+ chars); unset = per-account tokens. `auth --remove` also revokes unified access within the token-cache TTL (a restart re-loads any account whose OAuth grant is still stored) |
+| `DEFAULT_EMAIL_ACCOUNT` | first | account used when `account` is omitted |
+| `ENABLE_SETTINGS_TOOLS` | `false` | vacation, IMAP/POP, language, filters, forwarding, send-as |
+| `ENABLE_WORKSPACE_TOOLS` | `false` | delegates, S/MIME, CSE (dead on consumer accounts) |
+| `ENABLE_DANGEROUS_TOOLS` | `false` | permanent delete, raw send, insert/import — also needs explicit full scope |
+| `MCP_ALLOWED_HOSTS` | loopback | extra allowed `Host` values (tunnels, proxies); `host:port` entries match exactly |
+| `GMAIL_MCP_SCOPES` | derived | explicit scope override (comma/space separated URLs) |
+| `GMAIL_MCP_API_ROOT` | googleapis | Gmail REST root override (test doubles) |
+| `GMAIL_MCP_CALLBACK_PORT` | OS-assigned | fixed loopback OAuth callback port — set it on headless hosts so an `ssh -L port:127.0.0.1:port` forward from your browser machine stays valid across accounts |
+
+Tests: `pnpm test` (unit + HTTP integration), `pnpm e2e` (builds `dist/`, boots the real
+server against a fake Gmail REST API, drives it with a real MCP client across all four
+mode/auth legs). Docker: `ghcr.io/l92-labs/gmail-mcp` (pin by digest in deployments).
+
 
 A Streamable HTTP [Model Context Protocol](https://modelcontextprotocol.io) server covering the full Gmail API v1 surface — messages, threads, drafts, labels, filters, history, and every settings resource (send-as, forwarding, vacation, IMAP/POP, delegates, S/MIME, and client-side encryption).
 

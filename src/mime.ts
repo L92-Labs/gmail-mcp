@@ -50,8 +50,10 @@ const MIME_BY_EXT: Record<string, string> = {
 // than interpolated into a header line.
 const MIME_TOKEN = /^[\w.+-]+\/[\w.+-]+$/;
 
-// Header values go into a raw RFC 822 message; a CR/LF would inject headers.
-const clean = (v: string): string => v.replace(/[\r\n]+/g, " ").trim();
+// Header values go into a raw RFC 822 message; CR/LF — and the Unicode line
+// separators, which RFC parsers do not treat as breaks but which must never ride
+// inside a value — would inject or disguise headers.
+const clean = (v: string): string => v.replace(/[\r\n\u2028\u2029]+/g, " ").trim();
 // RFC 2047 for non-ASCII header text.
 const encodeWord = (v: string): string =>
   /^[\x20-\x7E]*$/.test(v) ? v : `=?UTF-8?B?${Buffer.from(v, "utf8").toString("base64")}?=`;

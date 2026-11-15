@@ -9,6 +9,7 @@ import {
   authorize, cachedTokenReader, generateToken, listAccounts, loadAccounts, normalizeEmail,
   readAccountToken, removeAccount, unknownAccountError, writeAccountToken, type LoadedAccount,
 } from "./auth.js";
+import { describeMode, parseConfig, type Features } from "./config.js";
 import { registerTools } from "./tools.js";
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -19,11 +20,14 @@ const SESSION_IDLE_MS = 60 * 60_000;
 interface Session {
   transport: StreamableHTTPServerTransport;
   lastSeen: number;
-  /** The account whose bearer token opened this session; no other token may use it. */
+  /** The account (or "*" for a shared token) whose bearer opened this session; no other token may use it. */
   email: string;
   /** sha256 hex of the token that opened this session, so a rotation revokes it even for the same email. */
   digest: string;
 }
+
+/** Session marker for the unified-token mode, where one bearer may act on every account. */
+const SHARED_SESSION = "*";
 
 export interface HandlerOptions {
   accounts: Map<string, LoadedAccount>;
@@ -32,6 +36,23 @@ export interface HandlerOptions {
   sessions?: Map<string, Session>;
   /** Looks up the current token for an email; defaults to the in-memory `accounts` entry. */
   tokenFor?: (email: string) => Promise<string | undefined>;
+  /**
+   * Fork: when set (MCP_BEARER_TOKEN), this one token authenticates every signed-in
+   * account and sessions may act across accounts via the `account` argument. When
+   * unset, upstream per-account bearer behavior applies unchanged.
+   */
+  sharedToken?: string;
+  /** Fork guardrails handed to the registered tools. Defaults to pull mode. */
+  features?: Features;
+  /** Fork: account used when `account` is omitted. Defaults to the first signed in. */
+  defaultAccount?: string;
+  /** Fork: extra Host header values accepted alongside loopback (tunnel/proxy frontends). */
+  extraHosts?: string[];
+  /**
+   * Fork, shared-token mode: store-backed probe run before each dispatch so
+   * `gmail-mcp auth --remove` also revokes unified-token access to a mailbox.
+   */
+  accountLive?: (email: string) => Promise<boolean>;
 }
 
 const digest = (v: string): Buffer => createHash("sha256").update(v).digest();
@@ -44,11 +65,17 @@ const digest = (v: string): Buffer => createHash("sha256").update(v).digest();
 export const authenticate = async (
   header: string | undefined,
   emails: Iterable<string>,
-  tokenFor: (email: string) => Promise<string | undefined>
+  tokenFor: (email: string) => Promise<string | undefined>,
+  sharedToken?: string
 ): Promise<{ email: string; digest: string } | undefined> => {
   const match = /^Bearer (\S+)$/i.exec(header ?? "");
   if (!match) return undefined;
   const candidate = digest(match[1]);
+  if (sharedToken) {
+    // Unified mode: one portal-style token, every account reachable. Per-account
+    // token files are not consulted.
+    return timingSafeEqual(candidate, digest(sharedToken)) ? { email: SHARED_SESSION, digest: candidate.toString("hex") } : undefined;
+  }
   let found: string | undefined;
   for (const email of emails) {
     let token: string | undefined;
@@ -81,10 +108,22 @@ export const createRequestHandler = ({
   port,
   sessions = new Map(),
   tokenFor = async (email) => accounts.get(email)?.token,
+  sharedToken,
+  features,
+  defaultAccount,
+  extraHosts = [],
+  accountLive,
 }: HandlerOptions) => {
   // The SDK compares the raw Host header, so list each name with and without the port.
-  // Anything else is a DNS-rebinding attempt.
-  const allowedHosts = [...new Set([host, "127.0.0.1", "localhost", "[::1]"])].flatMap((h) => [h, `${h}:${port}`]);
+  // Extra hosts serve tunnel/proxy frontends (e.g. a Cloudflare tunnel hostname);
+  // anything else is a DNS-rebinding attempt.
+  const loopbackAndHost = [...new Set([host, "127.0.0.1", "localhost", "[::1]"])].flatMap((h) => [h, `${h}:${port}`]);
+  // A port-bearing extra host matches exactly; a bare hostname also matches the
+  // server's own port, mirroring the loopback entries.
+  const allowedHosts = [
+    ...loopbackAndHost,
+    ...extraHosts.flatMap((h) => (/:\d+$/.test(h) ? [h] : [h, `${h}:${port}`])),
+  ];
 
   const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -97,7 +136,7 @@ export const createRequestHandler = ({
       // session id from a dead one.
       const auth = req.headers.authorization;
       const authHeader = Array.isArray(auth) ? auth[0] : auth;
-      const authResult = await authenticate(authHeader, accounts.keys(), tokenFor);
+      const authResult = await authenticate(authHeader, accounts.keys(), tokenFor, sharedToken);
       if (!authResult) {
         rpcError(res, 401, "Unauthorized", { "www-authenticate": "Bearer" });
         return;
@@ -145,8 +184,19 @@ export const createRequestHandler = ({
       });
       transport.onclose = () => transport.sessionId && sessions.delete(transport.sessionId);
       const server = new McpServer({ name: "gmail-mcp", version });
-      // The token binds the session to exactly one account, so that is all the session can see.
-      registerTools(server, { clients: new Map([[email, accounts.get(email)!.gmail]]), default: email });
+      // The token binds the session to exactly one account (per-account mode) or to the
+      // shared token (unified mode, marker email), so that is all the session can see.
+      const clients = sharedToken
+        ? new Map([...accounts].map(([email, loaded]) => [email, loaded.gmail]))
+        : new Map([[email, accounts.get(email)!.gmail]]);
+      registerTools(server, {
+        clients,
+        default: sharedToken ? (defaultAccount ?? [...clients.keys()][0]!) : email,
+        ...(features ? { features } : {}),
+        // Removal must revoke shared-token access; per-account mode already consults
+        // tokenFor on every request, so the probe is only needed here.
+        ...(sharedToken && accountLive ? { liveness: accountLive } : {}),
+      });
       await server.connect(transport);
       await transport.handleRequest(req, res);
     } catch (err) {
@@ -204,11 +254,18 @@ export const cli = async (argv: string[]): Promise<boolean> => {
   }
   if (flag) throw new Error(`Unknown option ${flag}. Usage: gmail-mcp auth [--remove <email>]`);
   await authorize();
+  // The Google clients hold keep-alive handles that would otherwise keep this process
+  // alive for minutes after the work is done. The timer only fires while that is the
+  // case; a naturally emptying event loop still exits on its own.
+  setTimeout(() => process.exit(0), 250).unref();
   return true;
 };
 
 const main = async (): Promise<void> => {
   if (await cli(process.argv.slice(2))) return;
+
+  // Guardrails parse before anything binds or loads: a bad deployment dies here.
+  const config = parseConfig();
 
   const loaded = await loadAccounts();
   if (!loaded) {
@@ -216,14 +273,35 @@ const main = async (): Promise<void> => {
     process.exit(1);
   }
   const { accounts } = loaded;
+  if (config.defaultAccount && !accounts.has(config.defaultAccount)) {
+    console.error(`DEFAULT_EMAIL_ACCOUNT "${config.defaultAccount}" is not signed in. Signed in: ${[...accounts.keys()].join(", ")}.`);
+    process.exit(1);
+  }
   console.error(
-    `gmail-mcp accounts: ${[...accounts.keys()].join(", ")}. ` +
-      "Every /mcp request needs `Authorization: Bearer <token>`; print one with `gmail-mcp token <email>`."
+    `gmail-mcp accounts: ${[...accounts.keys()].join(", ")}. Mode ${config.mode} (${describeMode(config.mode)}). ` +
+    (config.sharedToken
+      ? "Every /mcp request needs `Authorization: Bearer <MCP_BEARER_TOKEN>`; tools take `account` to pick a mailbox."
+      : "Every /mcp request needs `Authorization: Bearer <token>`; print one with `gmail-mcp token <email>`.") +
+    (config.settingsTools ? " Settings tools enabled." : "") +
+    (config.dangerousTools ? " DANGEROUS tools (permanent delete, raw send, import) enabled." : "")
   );
 
   const host = process.env.GMAIL_MCP_HOST || "127.0.0.1";
   const port = Number(process.env.GMAIL_MCP_PORT || process.env.PORT || 3016);
-  const { handler, sweep } = createRequestHandler({ accounts, host, port, tokenFor: cachedTokenReader() });
+  const tokenReader = cachedTokenReader();
+  const { handler, sweep } = createRequestHandler({
+    accounts,
+    host,
+    port,
+    tokenFor: tokenReader,
+    accountLive: config.sharedToken
+      ? async (email) => (await tokenReader(email)) !== undefined
+      : undefined,
+    sharedToken: config.sharedToken,
+    features: { mode: config.mode, allowlist: config.allowlist, settingsTools: config.settingsTools, workspaceTools: config.workspaceTools, dangerousTools: config.dangerousTools },
+    defaultAccount: config.defaultAccount,
+    extraHosts: config.extraHosts,
+  });
   setInterval(sweep, SESSION_IDLE_MS / 4).unref();
   createServer(handler).listen(port, host, () =>
     console.error(`gmail-mcp ${version} listening on http://${host}:${port}/mcp`)
