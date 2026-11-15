@@ -157,6 +157,11 @@ describe("recipientAllowed", () => {
     expect(recipientAllowed('a@corp.com, "B, C" <b@corp.com>', allowlist)).toBe(true);
   });
 
+  it("honors escaped quotes inside display names", () => {
+    expect(recipientAllowed('"Doe \\"Jane, Jr.\\"" <jane@corp.com>', allowlist)).toBe(true);
+    expect(recipientAllowed('"Doe \\"Jane, Jr.\\"" <jane@evil.test>', allowlist)).toBe(false);
+  });
+
   it("fails closed on segments without an @", () => {
     expect(recipientAllowed("not-an-address", allowlist)).toBe(false);
     expect(recipientAllowed("friend@corp.com, garbage", allowlist)).toBe(false);

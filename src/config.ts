@@ -84,7 +84,15 @@ export const splitRecipients = (recipient: string): string[] => {
   const parts: string[] = [];
   let current = "";
   let quoted = false;
-  for (const char of recipient) {
+  for (let i = 0; i < recipient.length; i++) {
+    const char = recipient[i]!;
+    // Quoted-pair escape: \" inside a display name is a literal quote and must not
+    // close the quoted string ('"Doe \\"Jane, Jr.\\"" <j@x>' stays one recipient).
+    if (quoted && char === "\\" && i + 1 < recipient.length) {
+      current += char + recipient[i + 1]!;
+      i += 1;
+      continue;
+    }
     if (char === '"') {
       quoted = !quoted;
       current += char;
